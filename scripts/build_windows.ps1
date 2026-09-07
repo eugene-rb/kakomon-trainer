@@ -26,4 +26,5 @@ if (-not $iscc) {
 }
 if (-not $iscc) { throw "Inno Setup 6 の ISCC.exe が見つかりません。https://jrsoftware.org/isinfo.php からインストールしてください。" }
 & $iscc packaging\KakomonTrainer.iss
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Host "Created release\KakomonTrainer-Setup.exe"
