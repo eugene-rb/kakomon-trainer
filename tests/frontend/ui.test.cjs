@@ -290,3 +290,48 @@ test("new questions automatically select paired answer references", async (t) =>
   assert.equal(checks.length, 2);
   assert.equal(Array.from(checks).every((checkbox) => checkbox.checked), true);
 });
+
+const installerConfig = { grading_ready: true, ocr_supports_words: true, updates_enabled: true };
+
+test("update button stays hidden outside the installer and config is fetched once", async (t) => {
+  const ui = await mount("index.html");
+  t.after(() => ui.dom.window.close());
+  assert.equal(ui.doc.getElementById("update-btn").hidden, true);
+  assert.equal(ui.calls.filter((call) => call.url === "/api/config").length, 1);
+});
+
+test("installer build reports being up to date without installing anything", async (t) => {
+  const ui = await mount("index.html", {
+    "/api/config": installerConfig,
+    "/api/update": { available: false, version: "0.1.0" },
+  });
+  t.after(() => ui.dom.window.close());
+  assert.equal(ui.doc.getElementById("update-btn").hidden, false);
+  await ui.w.checkForUpdate();
+  assert.match(ui.doc.getElementById("notice").textContent, /最新版/);
+  assert.equal(ui.calls.some((call) => call.url === "/api/update/install"), false);
+});
+
+test("installer build installs an available update after confirmation", async (t) => {
+  const ui = await mount("index.html", {
+    "/api/config": installerConfig,
+    "/api/update": { available: true, version: "0.1.0", latest_version: "0.2.0", notes: "" },
+    "/api/update/install": { message: "更新をダウンロードしました。アプリを閉じてインストールを開始します。" },
+  });
+  t.after(() => ui.dom.window.close());
+  await ui.w.checkForUpdate();
+  assert.equal(ui.calls.filter((call) => call.url === "/api/update/install").length, 1);
+  assert.match(ui.doc.getElementById("notice").textContent, /インストールを開始/);
+  assert.equal(ui.doc.getElementById("update-btn").disabled, false);
+});
+
+test("a failed update check is reported instead of looking successful", async (t) => {
+  const ui = await mount("index.html", {
+    "/api/config": installerConfig,
+    "/api/update": () => { throw new Error("offline"); },
+  });
+  t.after(() => ui.dom.window.close());
+  await ui.w.checkForUpdate();
+  assert.match(ui.doc.getElementById("notice").textContent, /更新を確認できませんでした/);
+  assert.equal(ui.doc.getElementById("update-btn").disabled, false);
+});

@@ -437,3 +437,59 @@ def test_batch_registration_reports_partial_failure_and_cleans_failed_sheet(clie
     assert [row["sheet"] for row in result["failures"]] == ["bad_sheet.pdf"]
     assert not settings.template_dir("bad_sheet").exists()
     assert settings.template_dir("valid_sheet").exists()
+
+
+# ---------------------------------------------------------------------------
+# 自動更新エンドポイント（SPEC: Windows 配布版）
+# ---------------------------------------------------------------------------
+
+
+def test_config_hides_updates_outside_installer(client):
+    """ソース実行では更新 UI を出さない（インストーラーが無いため実行できない）。"""
+    body = client.get("/api/config").json()
+    assert body["updates_enabled"] is False
+    assert body["version"]
+
+
+def test_check_update_without_repository_reports_no_update(client):
+    """UPDATE_REPOSITORY 未設定なら、ネットワークに出ずに「更新なし」を返す。"""
+    assert client.get("/api/update").json()["available"] is False
+
+
+def test_check_update_reports_available_release(client, monkeypatch):
+    from app.updater import Release
+
+    release = Release(
+        version="99.0.0",
+        asset_url="https://github.com/owner/repo/releases/download/v99.0.0/KakomonTrainer-Setup.exe",
+        asset_name="KakomonTrainer-Setup.exe",
+        notes="新機能",
+    )
+    monkeypatch.setattr(main_module, "latest_release", lambda repository: release)
+
+    body = client.get("/api/update").json()
+    assert body["available"] is True
+    assert body["latest_version"] == "99.0.0"
+    assert body["notes"] == "新機能"
+
+
+def test_install_update_without_release_returns_409(client):
+    response = client.post("/api/update/install")
+    assert response.status_code == 409
+    assert "更新" in response.json()["detail"]
+
+
+def test_install_update_outside_installer_returns_400(client, monkeypatch):
+    """ソース実行で更新を要求されたら、500 ではなく日本語の 400 で断る。"""
+    from app.updater import Release
+
+    release = Release(
+        version="99.0.0",
+        asset_url="https://github.com/owner/repo/releases/download/v99.0.0/KakomonTrainer-Setup.exe",
+        asset_name="KakomonTrainer-Setup.exe",
+    )
+    monkeypatch.setattr(main_module, "latest_release", lambda repository: release)
+
+    response = client.post("/api/update/install")
+    assert response.status_code == 400
+    assert "インストール版" in response.json()["detail"]

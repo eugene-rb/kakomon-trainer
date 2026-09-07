@@ -23,9 +23,9 @@ from app import logger as log_module
 from app import pdfutil, refs as refs_module, scanner, storage, template_builder
 from app.annotator import build_graded_pdf
 from app.config import ConfigError, MissingCredentialError, get_settings
-from app.runtime import is_frozen, resource_dir
+from app.runtime import config_dir, is_frozen, resource_dir
 from app.updater import download_and_install, latest_release
-from app.version import __version__
+from app.version import APP_NAME, __version__
 from app.grader import grade_session
 from app.llm import get_answer_check_backend, get_grading_backend
 from app.models import (
@@ -637,8 +637,85 @@ def index() -> RedirectResponse:
     return RedirectResponse(url="/static/index.html")
 
 
+def _loopback_host() -> str:
+    """ブラウザから到達できるホスト名（待ち受けが全インターフェースでも 127.0.0.1 を使う）。"""
+    return "127.0.0.1" if settings.host in {"", "0.0.0.0", "::"} else settings.host
+
+
+_STARTUP_ERROR_TEMPLATE = """{reason}
+
+設定ファイル:
+{env_path}
+
+このファイルをテキストエディタで開いて設定を保存し、もう一度起動してください。"""
+
+
+def _show_startup_error(reason: str) -> None:
+    """GUI ビルドは標準エラー出力を持たないため、起動失敗をダイアログで知らせる。"""
+    import ctypes
+
+    text = _STARTUP_ERROR_TEMPLATE.format(reason=reason, env_path=config_dir() / ".env")
+    ctypes.windll.user32.MessageBoxW(None, text, f"{APP_NAME} - 起動できません", 0x10)
+
+
+def _open_browser_when_ready(url: str, host: str, port: int, timeout: float = 30.0) -> None:
+    """GUI ビルドは窓を持たないので、サーバーが応答したらブラウザで UI を開く。"""
+    import socket
+    import time
+    import webbrowser
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                webbrowser.open(url)
+                return
+        except OSError:
+            time.sleep(0.3)
+
+
+def _port_is_serving(host: str, port: int) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _run_frozen() -> None:
+    """インストール版の起動。設定不備と二重起動を利用者に見える形で扱う。"""
+    import threading
+
+    import uvicorn
+
+    host = _loopback_host()
+    url = f"http://{host}:{settings.port}/"
+    # 二重起動時は uvicorn がバインドに失敗して無言で終わるため、既存のUIを開くだけにする。
+    if _port_is_serving(host, settings.port):
+        import webbrowser
+
+        webbrowser.open(url)
+        return
+    try:
+        settings.ensure_dirs()
+        settings.validate_ocr_or_die()
+    except ConfigError as e:
+        _show_startup_error(str(e))
+        raise SystemExit(1) from e
+    threading.Thread(
+        target=_open_browser_when_ready, args=(url, host, settings.port), daemon=True
+    ).start()
+    uvicorn.run(app, host=settings.host, port=settings.port)
+
+
 def main() -> None:
     """``python -m app.main`` で起動する。"""
+    if is_frozen():
+        _run_frozen()
+        return
+
     import uvicorn
 
     uvicorn.run(app, host=settings.host, port=settings.port)

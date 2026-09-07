@@ -121,7 +121,8 @@ async function loadConfig() {
     if (!config.grading_ready) {
       showNotice(document.getElementById("config-notice"), `記述式の採点には設定が必要です: ${config.grading_error}\nテンプレートの作成・OCR転記・「答えのみ」の自動照合は利用できます。`, "warn");
     }
-  } catch (e) { /* 設定表示は失敗しても致命的ではない */ }
+    return config;
+  } catch (e) { return null; /* 設定表示は失敗しても致命的ではない */ }
 }
 
 async function checkForUpdate() {
@@ -383,14 +384,14 @@ async function refresh() {
 }
 
 document.getElementById("refresh-btn").addEventListener("click", refresh);
-loadConfig();
-const updateButton = document.getElementById("update-btn");
-loadConfig().then(() => api("/api/config")).then((config) => {
-  if (config.updates_enabled) {
+// 更新はインストール版でしか実行できないため、その時だけボタンを出す。
+loadConfig().then((config) => {
+  if (config && config.updates_enabled) {
+    const updateButton = document.getElementById("update-btn");
     updateButton.hidden = false;
     updateButton.addEventListener("click", checkForUpdate);
   }
-}).catch(() => {});
+});
 refresh();
 </script>
 </body>
