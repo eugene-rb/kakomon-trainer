@@ -1,0 +1,3 @@
+# 任意の OCR バックエンド用。OCR_BACKEND=azure_di を使う場合のみインストールする。
+#   pip install -r requirements-optional.txt
+azure-ai-documentintelligence

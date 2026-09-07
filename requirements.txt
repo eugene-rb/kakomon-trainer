@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pymupdf
+opencv-python
+numpy
+pillow
+qrcode[pil]
+anthropic
+openai
+pydantic
+pydantic-settings
+python-multipart
+google-cloud-vision
+pytest

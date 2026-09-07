@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>領域指定エディタ</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">本文へ移動</a>
+<header>
+  <h1>領域指定エディタ</h1>
+  <nav><a href="/static/index.html">ホーム</a></nav>
+  <span id="template-name" class="muted"></span>
+  <span class="header-actions">
+    <a id="print-link" hidden target="_blank" rel="noopener">印刷用PDF</a>
+    <span id="save-state" class="muted" aria-live="polite"></span>
+    <button id="save-btn" class="primary" disabled>保存</button>
+  </span>
+</header>
+
+<main id="main">
+  <div id="notice" aria-live="polite"></div>
+  <div class="tabs" id="page-tabs"></div>
+
+  <div class="editor-layout">
+    <div class="canvas-pane">
+      <div class="canvas-wrap"><canvas id="page-canvas" width="800" height="1100" tabindex="0" aria-label="解答欄の領域を指定する用紙。設問を選択してドラッグしてください。"></canvas></div>
+    </div>
+
+    <div class="side-pane">
+      <div class="panel">
+        <h2>設問</h2>
+        <p class="muted">設問を選んでから画像上をドラッグすると領域を追加します。矩形をクリックで選択、四隅をドラッグでリサイズ、Delete キーで削除。</p>
+        <button id="add-question" disabled>＋ 設問を追加</button>
+        <button id="delete-region" disabled>選択した領域を削除</button>
+        <p id="question-summary" class="muted" aria-live="polite"></p>
+        <div id="question-list" style="margin-top:10px"></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script src="/static/app.js"></script>
+<script>
+"use strict";
+
+const templateId = queryParam("template");
+const notice = document.getElementById("notice");
+const canvas = document.getElementById("page-canvas");
+const ctx = canvas.getContext("2d");
+
+let template = null;
+let refTree = [];
+let currentPage = 1;
+let pageImage = null;
+let selectedQuestion = 0;
+let selectedRegion = null;   // {questionIndex, regionIndex}
+let drag = null;             // {mode:'create'|'move'|'resize', ...}
+let dirty = false;
+let saving = false;
+let editVersion = 0;
+let imageVersion = 0;
+
+const HANDLE = 7;
+
+// 採点形式（app/models.py の AnswerFormat と対応）。旧値の読み替えと言語固定。
+const LEGACY_FORMAT = { "": "essay", written: "essay" };
+const FORMAT_FIXED_LANG = { translation_ja: "ja", translation_en: "en", composition_en: "en" };
+function normalizeFormat(v) { return LEGACY_FORMAT[v] || v || "essay"; }
+
+function markDirty() {
+  editVersion += 1;
+  dirty = true;
+  document.getElementById("save-state").textContent = "未保存の変更があります";
+  document.getElementById("question-summary").textContent = `${template.questions.length}問 / 合計 ${template.questions.reduce((sum, q) => sum + q.max_score, 0)}点`;
+}
+
+/** 正規化座標 → キャンバスのピクセル座標 */
+function toCanvas(rect) {
+  return {
+    x: rect[0] * canvas.width, y: rect[1] * canvas.height,
+    w: (rect[2] - rect[0]) * canvas.width, h: (rect[3] - rect[1]) * canvas.height,
+  };
+}
+
+function eventPos(ev) {
+  const box = canvas.getBoundingClientRect();
+  return {
+    x: Math.min(Math.max((ev.clientX - box.left) / box.width, 0), 1),
+    y: Math.min(Math.max((ev.clientY - box.top) / box.height, 0), 1),
+  };
+}
+
+function currentRegions() {
+  const list = [];
+  if (!template) return list;
+  template.questions.forEach((question, qi) => {
+    question.regions.forEach((region, ri) => {
+      if (region.page_no === currentPage) list.push({ question, qi, region, ri });
+    });
+  });
+  return list;
+}
+
+function draw() {
+  document.getElementById("delete-region").disabled = !selectedRegion;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (pageImage) ctx.drawImage(pageImage, 0, 0, canvas.width, canvas.height);
+
+  for (const item of currentRegions()) {
+    const { x, y, w, h } = toCanvas(item.region.rect);
+    const color = questionColor(item.qi);
+    const isSelected = selectedRegion && selectedRegion.questionIndex === item.qi && selectedRegion.regionIndex === item.ri;
+
+    ctx.fillStyle = color + "22";
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = isSelected ? 2.5 : 1.5;
+    ctx.strokeRect(x, y, w, h);
+
+    ctx.font = "12px sans-serif";
+    const label = `${item.question.id || "(ID未設定)"}${item.question.regions.length > 1 ? ` [${item.ri + 1}]` : ""}`;
+    const width = ctx.measureText(label).width + 8;
+    ctx.fillStyle = color;
+    ctx.fillRect(x, Math.max(0, y - 15), width, 15);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(label, x + 4, Math.max(11, y - 4));
+
+    if (isSelected) {
+      ctx.fillStyle = color;
+      for (const [hx, hy] of [[x, y], [x + w, y], [x, y + h], [x + w, y + h]]) {
+        ctx.fillRect(hx - HANDLE / 2, hy - HANDLE / 2, HANDLE, HANDLE);
+      }
+    }
+  }
+
+  if (drag && drag.mode === "create" && drag.current) {
+    const x0 = Math.min(drag.start.x, drag.current.x) * canvas.width;
+    const y0 = Math.min(drag.start.y, drag.current.y) * canvas.height;
+    ctx.setLineDash([5, 3]);
+    ctx.strokeStyle = questionColor(selectedQuestion);
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(x0, y0, Math.abs(drag.current.x - drag.start.x) * canvas.width,
+                   Math.abs(drag.current.y - drag.start.y) * canvas.height);
+    ctx.setLineDash([]);
+  }
+}
+
+function hitTest(pos) {
+  const items = currentRegions().reverse();
+  for (const item of items) {
+    const { x, y, w, h } = toCanvas(item.region.rect);
+    const px = pos.x * canvas.width, py = pos.y * canvas.height;
+    const corners = { nw: [x, y], ne: [x + w, y], sw: [x, y + h], se: [x + w, y + h] };
+    for (const [name, [cx, cy]] of Object.entries(corners)) {
+      if (Math.abs(px - cx) <= HANDLE && Math.abs(py - cy) <= HANDLE) {
+        return { item, handle: name };
+      }
+    }
+    if (px >= x && px <= x + w && py >= y && py <= y + h) return { item, handle: null };
+  }
+  return null;
+}
+
+canvas.addEventListener("pointerdown", (ev) => {
+  if (!template || !pageImage || ev.button !== 0) return;
+  canvas.setPointerCapture(ev.pointerId);
+  canvas.focus();
+  const pos = eventPos(ev);
+  const hit = hitTest(pos);
+  if (hit) {
+    selectedRegion = { questionIndex: hit.item.qi, regionIndex: hit.item.ri };
+    selectedQuestion = hit.item.qi;
+    drag = hit.handle
+      ? { mode: "resize", handle: hit.handle, target: hit.item }
+      : { mode: "move", target: hit.item, origin: pos, rect: [...hit.item.region.rect] };
+    renderQuestions();
+  } else {
+    if (!template.questions.length) {
+      showNotice(notice, "先に設問を追加してください。", "warn");
+      return;
+    }
+    drag = { mode: "create", start: pos, current: pos };
+    selectedRegion = null;
+  }
+  draw();
+});
+
+canvas.addEventListener("pointermove", (ev) => {
+  if (!drag) return;
+  const pos = eventPos(ev);
+  if (drag.mode === "create") {
+    drag.current = pos;
+  } else if (drag.mode === "resize") {
+    const rect = drag.target.region.rect;
+    const next = [...rect];
+    if (drag.handle.includes("n")) next[1] = Math.max(0, Math.min(pos.y, next[3] - 0.002));
+    if (drag.handle.includes("s")) next[3] = Math.min(1, Math.max(pos.y, next[1] + 0.002));
+    if (drag.handle.includes("w")) next[0] = Math.max(0, Math.min(pos.x, next[2] - 0.002));
+    if (drag.handle.includes("e")) next[2] = Math.min(1, Math.max(pos.x, next[0] + 0.002));
+    drag.target.region.rect = [
+      Math.min(next[0], next[2]), Math.min(next[1], next[3]),
+      Math.max(next[0], next[2]), Math.max(next[1], next[3]),
+    ];
+    markDirty();
+  } else if (drag.mode === "move") {
+    const dx = pos.x - drag.origin.x, dy = pos.y - drag.origin.y;
+    const [x0, y0, x1, y1] = drag.rect;
+    const w = x1 - x0, h = y1 - y0;
+    const nx = Math.min(Math.max(x0 + dx, 0), 1 - w);
+    const ny = Math.min(Math.max(y0 + dy, 0), 1 - h);
+    drag.target.region.rect = [nx, ny, nx + w, ny + h];
+    markDirty();
+  }
+  draw();
+});
+
+canvas.addEventListener("pointerup", () => {
+  if (drag && drag.mode === "create" && drag.current) {
+    const x0 = Math.min(drag.start.x, drag.current.x), x1 = Math.max(drag.start.x, drag.current.x);
+    const y0 = Math.min(drag.start.y, drag.current.y), y1 = Math.max(drag.start.y, drag.current.y);
+    if (x1 - x0 > 0.01 && y1 - y0 > 0.01) {
+      const question = template.questions[selectedQuestion];
+      question.regions.push({ page_no: currentPage, rect: [x0, y0, x1, y1] });
+      selectedRegion = { questionIndex: selectedQuestion, regionIndex: question.regions.length - 1 };
+      markDirty();
+      renderQuestions();
+    }
+  }
+  drag = null;
+  draw();
+});
+
+canvas.addEventListener("pointercancel", () => { drag = null; draw(); });
+
+function deleteRegion() {
+  if (!template || !selectedRegion) return;
+  template.questions[selectedRegion.questionIndex].regions.splice(selectedRegion.regionIndex, 1);
+  selectedRegion = null;
+  markDirty();
+  renderQuestions();
+  draw();
+}
+document.getElementById("delete-region").addEventListener("click", deleteRegion);
+
+window.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Delete" && ev.key !== "Backspace") return;
+  if (["INPUT", "TEXTAREA", "SELECT"].includes(document.activeElement.tagName)) return;
+  if (!selectedRegion) return;
+  ev.preventDefault();
+  deleteRegion();
+});
+
+function refCheckboxes(question, qi) {
+  const container = el("div", { class: "ref-tree" });
+  const walk = (nodes, depth) => {
+    for (const node of nodes) {
+      if (node.is_dir) {
+        container.appendChild(el("div", { class: "dir", text: "　".repeat(depth) + "📁 " + node.name }));
+        walk(node.children, depth + 1);
+      } else {
+        const checkbox = el("input", { type: "checkbox" });
+        checkbox.checked = question.refs.includes(node.path);
+        checkbox.addEventListener("change", () => {
+          question.refs = checkbox.checked
+            ? [...question.refs, node.path]
+            : question.refs.filter((p) => p !== node.path);
+          markDirty();
+        });
+        container.appendChild(el("label", {}, [checkbox, "　".repeat(depth) + node.name]));
+      }
+    }
+  };
+  if (!refTree.length) {
+    container.appendChild(el("div", { class: "muted", text: "refs/ に資料がありません。下のフォームからアップロードできます。" }));
+  } else {
+    walk(refTree, 0);
+  }
+  return container;
+}
+
+function renderQuestions() {
+  const list = document.getElementById("question-list");
+  list.innerHTML = "";
+  document.getElementById("question-summary").textContent = `${template.questions.length}問 / 合計 ${template.questions.reduce((sum, q) => sum + q.max_score, 0)}点`;
+  if (!template.questions.length) list.appendChild(el("p", { class: "muted", text: "「設問を追加」から始めましょう。設問ごとに用紙上の解答欄を囲みます。" }));
+  template.questions.forEach((question, qi) => {
+    const item = el("div", { class: `question-item${qi === selectedQuestion ? " selected" : ""}` });
+    item.addEventListener("click", (ev) => {
+      // フォーム部品の操作でカード全体を再描画すると、開いた <select> が閉じ、
+      // 入力中のフォーカスも外れる。部品以外をクリックしたときだけ選択を切り替える。
+      if (ev.target.closest("input, select, textarea, button, label")) return;
+      if (selectedQuestion !== qi) { selectedQuestion = qi; selectedRegion = null; renderQuestions(); draw(); }
+    });
+    item.addEventListener("focusin", () => {
+      if (selectedQuestion === qi) return;
+      selectedQuestion = qi;
+      selectedRegion = null;
+      list.querySelectorAll(".question-item").forEach((card, index) => card.classList.toggle("selected", index === qi));
+      draw();
+    });
+
+    const bind = (input, field, parse = (v) => v) => {
+      input.addEventListener("input", () => { question[field] = parse(input.value); markDirty(); draw(); });
+      return input;
+    };
+
+    const idInput = bind(el("input", { type: "text", value: question.id }), "id");
+    const typeInput = bind(el("input", { type: "text", value: question.type, placeholder: "大問・小問番号やメモ（任意）" }), "type");
+    const scoreInput = bind(el("input", { type: "number", min: "0", value: String(question.max_score) }), "max_score", (v) => parseInt(v || "0", 10));
+    const answerFormat = normalizeFormat(question.answer_format);
+    const fixedLang = FORMAT_FIXED_LANG[answerFormat];
+    question.answer_format = answerFormat;           // 旧値・空値を正規化して保存に反映
+    if (fixedLang) question.language = fixedLang;     // 形式が言語を固定する場合はそろえる
+
+    const langSelect = el("select", {}, [
+      el("option", { value: "ja", text: "ja（日本語）" }),
+      el("option", { value: "en", text: "en（英語）" }),
+    ]);
+    langSelect.value = question.language;
+    bind(langSelect, "language");
+    const noteInput = bind(el("textarea", { rows: "2", placeholder: "採点上の注意" }), "note");
+    noteInput.value = question.note;
+
+    const formatSelect = el("select", {}, [
+      el("optgroup", { label: "共通" }, [
+        el("option", { value: "answer_only", text: "答えのみ（自動照合）" }),
+        el("option", { value: "essay", text: "記述・論述（国語ほか汎用）" }),
+      ]),
+      el("optgroup", { label: "英語" }, [
+        el("option", { value: "translation_ja", text: "和訳" }),
+        el("option", { value: "translation_en", text: "英訳" }),
+        el("option", { value: "composition_en", text: "自由英作文" }),
+      ]),
+      el("optgroup", { label: "数学" }, [
+        el("option", { value: "math_proof", text: "証明・数式記述" }),
+      ]),
+      el("optgroup", { label: "物理・化学" }, [
+        el("option", { value: "sci_derivation", text: "計算・導出" }),
+        el("option", { value: "sci_explanation", text: "論述・理由説明" }),
+      ]),
+      el("optgroup", { label: "作図（答案画像で採点）" }, [
+        el("option", { value: "graph", text: "グラフ・作図" }),
+        el("option", { value: "chem_structure", text: "構造式" }),
+      ]),
+    ]);
+    formatSelect.value = answerFormat;
+    formatSelect.addEventListener("change", () => {
+      question.answer_format = formatSelect.value;
+      const fixed = FORMAT_FIXED_LANG[formatSelect.value];
+      if (fixed) question.language = fixed;
+      markDirty();
+      renderQuestions();
+    });
+    const answerKeyInput = bind(el("textarea", { rows: "2", placeholder: "模範解答。複数正答は改行または | 区切り" }), "answer_key");
+    answerKeyInput.value = question.answer_key || "";
+    const toleranceInput = bind(
+      el("input", { type: "number", min: "0", step: "any", value: String(question.answer_tolerance || 0) }),
+      "answer_tolerance",
+      (v) => parseFloat(v || "0") || 0,
+    );
+
+    item.appendChild(el("header", {}, [
+      el("span", {}, [
+        el("span", { class: "swatch", style: `background:${questionColor(qi)}` }),
+        el("strong", { text: question.id || "(ID未設定)" }),
+        el("span", { class: "muted", text: `　領域 ${question.regions.length}` }),
+      ]),
+      el("span", {}, [
+        el("button", { text: "↑", title: "上へ", "aria-label": `${question.id} を上へ`, disabled: qi === 0 ? "disabled" : null, onclick: (ev) => { ev.stopPropagation(); if (qi > 0) { const [q] = template.questions.splice(qi, 1); template.questions.splice(qi - 1, 0, q); selectedQuestion = qi - 1; selectedRegion = null; markDirty(); renderQuestions(); draw(); } } }),
+        el("button", { text: "↓", title: "下へ", "aria-label": `${question.id} を下へ`, disabled: qi === template.questions.length - 1 ? "disabled" : null, onclick: (ev) => { ev.stopPropagation(); if (qi < template.questions.length - 1) { const [q] = template.questions.splice(qi, 1); template.questions.splice(qi + 1, 0, q); selectedQuestion = qi + 1; selectedRegion = null; markDirty(); renderQuestions(); draw(); } } }),
+        el("button", { class: "danger", text: "削除", onclick: (ev) => { ev.stopPropagation(); if (confirm(`設問 ${question.id} を削除しますか？`)) { template.questions.splice(qi, 1); selectedQuestion = Math.max(0, qi - 1); selectedRegion = null; markDirty(); renderQuestions(); draw(); } } }),
+      ]),
+    ]));
+
+    const grid = el("div", { class: "field-grid" }, [
+      el("div", {}, [el("label", { text: "設問 ID" }), idInput]),
+      el("div", {}, [el("label", { text: "メモ" }), typeInput]),
+      el("div", {}, [el("label", { text: "配点" }), scoreInput]),
+      el("div", {}, [
+        el("label", { text: "解答言語" }),
+        fixedLang
+          ? el("div", { class: "muted", text: `${fixedLang}（採点形式により固定）` })
+          : langSelect,
+      ]),
+    ]);
+    item.appendChild(grid);
+    item.appendChild(el("div", { class: "field-grid", style: "margin-top:6px" }, [
+      el("div", {}, [el("label", { text: "採点形式" }), formatSelect]),
+      answerFormat === "answer_only"
+        ? el("div", {}, [el("label", { text: "数値の許容誤差（絶対値。0 は既定値を継承）" }), toleranceInput])
+        : null,
+    ]));
+    if (answerFormat === "answer_only") {
+      item.appendChild(el("div", { style: "margin-top:6px" }, [el("label", { text: "正答" }), answerKeyInput]));
+    }
+    item.appendChild(el("div", { style: "margin-top:6px" }, [el("label", { text: "採点上の注意" }), noteInput]));
+    item.appendChild(el("div", { style: "margin-top:6px" }, [el("label", { text: "参照資料（模範解答・採点基準）" }), refCheckboxes(question, qi)]));
+    list.appendChild(item);
+    item.querySelectorAll("input:not([type=checkbox]), select, textarea").forEach((input, index) => {
+      input.id = `question-${qi}-field-${index}`;
+      const label = input.parentElement.querySelector("label");
+      if (label) label.htmlFor = input.id;
+    });
+  });
+
+  const uploadInput = el("input", { type: "file", id: "ref-files", multiple: "multiple", accept: ".pdf,.md,.txt" });
+  list.appendChild(el("div", { class: "panel", style: "margin-top:12px" }, [
+    el("label", { for: "ref-files", text: "参照資料をアップロード（.pdf .md .txt）" }),
+    uploadInput,
+    el("button", {
+      text: "アップロード",
+      style: "margin-top:6px",
+      onclick: async (ev) => {
+        if (!uploadInput.files.length) return;
+        const button = ev.currentTarget;
+        setBusy(button, true, "アップロード中…");
+        const form = new FormData();
+        for (const file of uploadInput.files) form.append("files", file);
+        try {
+          refTree = await api(`/api/templates/${encodeURIComponent(templateId)}/refs`, { method: "POST", body: form });
+          uploadInput.value = "";
+          renderQuestions();
+          showNotice(notice, "参照資料をアップロードしました。", "info");
+        } catch (e) { showNotice(notice, e.message, "error"); }
+        finally { setBusy(button, false); }
+      },
+    }),
+  ]));
+}
+
+function renderTabs() {
+  const tabs = document.getElementById("page-tabs");
+  tabs.innerHTML = "";
+  for (const page of template.pages) {
+    tabs.appendChild(el("button", {
+      class: page.page_no === currentPage ? "active" : "",
+      "aria-pressed": String(page.page_no === currentPage),
+      text: `${page.page_no} ページ`,
+      onclick: () => { currentPage = page.page_no; selectedRegion = null; drag = null; renderTabs(); loadPageImage(); },
+    }));
+  }
+}
+
+function loadPageImage() {
+  const version = ++imageVersion;
+  pageImage = null;
+  draw();
+  const page = template.pages.find((p) => p.page_no === currentPage) || template.pages[0];
+  if (!page) { showNotice(notice, "ページがありません。ホームからテンプレートを作り直してください。", "error"); return; }
+  const image = new Image();
+  image.onload = () => {
+    if (version !== imageVersion) return;
+    // 表示用に縮小するが、座標は正規化値で保持するのでズレない
+    canvas.width = image.width;
+    canvas.height = image.height;
+    canvas.style.width = Math.min(image.width, 900) + "px";
+    canvas.style.height = "auto";
+    pageImage = image;
+    draw();
+  };
+  image.onerror = () => { if (version === imageVersion) showNotice(notice, "ページ画像を読み込めませんでした。ページボタンで再試行できます。", "error"); };
+  image.src = `/api/templates/${encodeURIComponent(templateId)}/page/${page.page_no}.png?dpi=150`;
+}
+
+document.getElementById("add-question").addEventListener("click", () => {
+  if (!template) return;
+  let number = 1;
+  while (template.questions.some((q) => q.id === `Q${number}`)) number += 1;
+  template.questions.push({
+    id: `Q${number}`, type: "", max_score: 10, regions: [], refs: [...(template.default_refs || [])], note: "", language: "ja",
+    answer_format: "essay", answer_key: "", answer_tolerance: 0,
+  });
+  selectedQuestion = template.questions.length - 1;
+  selectedRegion = null;
+  markDirty();
+  renderQuestions();
+  draw();
+  document.querySelectorAll(".question-item")[selectedQuestion].querySelector("input").focus();
+});
+
+document.getElementById("save-btn").addEventListener("click", async () => {
+  if (!template || saving) return;
+  const ids = template.questions.map((q) => q.id.trim());
+  if (ids.some((id) => !id)) { showNotice(notice, "設問 ID が空の設問があります。", "error"); return; }
+  if (new Set(ids).size !== ids.length) { showNotice(notice, "設問 ID が重複しています。", "error"); return; }
+  const missingKey = template.questions.find((q) => q.answer_format === "answer_only" && !q.answer_key.trim());
+  if (missingKey) { showNotice(notice, `${missingKey.id}: 「答えのみ」の正答を入力してください。`, "error"); return; }
+  for (const input of document.querySelectorAll("#question-list input")) {
+    if (!input.reportValidity()) return;
+  }
+  template.questions.forEach((q, index) => { q.id = ids[index]; });
+  saving = true;
+  const version = editVersion;
+  const button = document.getElementById("save-btn");
+  setBusy(button, true, "保存中…");
+  try {
+    const saved = await apiJson(`/api/templates/${encodeURIComponent(templateId)}`, "PUT", template);
+    if (editVersion === version) {
+      template = saved;
+      dirty = false;
+      document.getElementById("save-state").textContent = "保存しました";
+      const incomplete = template.questions.filter((q) => !q.regions.length);
+      showNotice(notice, incomplete.length ? `下書きを保存しました。${incomplete.map((q) => q.id).join("、")} の解答領域を指定するとスキャンできます。` : "保存しました。印刷用PDFに解答し、ホームからスキャンを投入できます。", incomplete.length ? "warn" : "info");
+      renderQuestions();
+      draw();
+    } else {
+      showNotice(notice, "保存中に加えた変更が残っています。もう一度保存してください。", "warn");
+    }
+  } catch (e) {
+    showNotice(notice, e.message, "error");
+  }
+  finally { saving = false; setBusy(button, false); }
+});
+
+window.addEventListener("beforeunload", (ev) => {
+  if (dirty) { ev.preventDefault(); ev.returnValue = ""; }
+});
+
+(async function init() {
+  if (!templateId) { showNotice(notice, "テンプレートが指定されていません。", "error"); return; }
+  try {
+    template = await api(`/api/templates/${encodeURIComponent(templateId)}`);
+    refTree = await api(`/api/templates/${encodeURIComponent(templateId)}/refs`);
+    document.getElementById("template-name").textContent = `${template.template_id}${template.title ? " — " + template.title : ""}`;
+    document.getElementById("save-btn").disabled = false;
+    document.getElementById("add-question").disabled = false;
+    const printLink = document.getElementById("print-link");
+    printLink.href = `/api/templates/${encodeURIComponent(templateId)}/blank.pdf`;
+    printLink.hidden = false;
+    currentPage = template.pages.length ? template.pages[0].page_no : 1;
+    renderTabs();
+    renderQuestions();
+    loadPageImage();
+    if (queryParam("new") === "1") showNotice(notice, template.default_refs?.length
+      ? `用紙を登録し、解答解説 ${template.default_refs.length}件を対応付けました。追加する設問には、この参照資料が自動で選択されます。解答欄と配点を設定してください。`
+      : "用紙を登録しました。「設問を追加」から解答欄と配点を設定してください。");
+  } catch (e) {
+    showNotice(notice, e.message, "error");
+  }
+})();
+</script>
+</body>
+</html>

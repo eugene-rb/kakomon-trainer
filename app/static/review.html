@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>転記確認・採点結果</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<a class="skip-link" href="#main">本文へ移動</a>
+<header>
+  <h1>転記確認・採点結果</h1>
+  <nav><a href="/static/index.html">ホーム</a></nav>
+  <span id="session-name" class="muted"></span>
+  <span class="header-actions">
+    <span id="status-area" aria-live="polite"></span>
+    <span id="save-state" class="muted" aria-live="polite"></span>
+    <button id="save-btn" disabled>転記を保存</button>
+    <button id="grade-btn" class="primary" disabled>保存して採点</button>
+  </span>
+</header>
+
+<main id="main">
+  <div id="notice" aria-live="polite"></div>
+  <div id="warnings"></div>
+
+  <section class="panel" id="failed-panel" style="display:none">
+    <h2>位置合わせに失敗したページ</h2>
+    <p class="muted">
+      次を確認してください: スキャン解像度が 300dpi 以上か / 四隅が切れていないか / 影・折れがないか。
+      他のページの処理は継続しています。
+    </p>
+    <div id="failed-list" class="row"></div>
+  </section>
+
+  <section class="panel">
+    <h2>転記の確認</h2>
+    <p class="muted">左の答案画像と転記を見比べ、誤認識を直してください。「保存して採点」で修正内容を保存してから採点します。画像をクリックすると拡大して確認できます。</p>
+    <div id="crop-list"><span class="spinner">読み込み中…</span></div>
+  </section>
+
+  <section class="panel" id="result-panel" style="display:none">
+    <h2>採点結果</h2>
+    <div id="result-summary"></div>
+    <div id="result-list"></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+<script>
+"use strict";
+
+const sessionId = queryParam("session");
+const notice = document.getElementById("notice");
+let session = null;
+let template = null;
+let polling = null;
+let dirty = false;
+let busy = false;
+let pollFailures = 0;
+
+function editable() {
+  return session && ["ready", "graded", "failed"].includes(session.status) && session.transcriptions.length > 0;
+}
+
+function markDirty() {
+  dirty = true;
+  document.getElementById("save-state").textContent = "未保存の変更があります";
+  if (session.status === "graded") {
+    document.getElementById("result-panel").style.display = "none";
+    showNotice(notice, "転記を変更しました。修正後の結果を見るには、保存して再採点してください。");
+  }
+}
+
+window.addEventListener("beforeunload", (ev) => {
+  if (dirty) { ev.preventDefault(); ev.returnValue = ""; }
+});
+
+function updateControls() {
+  const ready = editable() && !busy;
+  document.getElementById("grade-btn").disabled = !ready;
+  document.getElementById("save-btn").disabled = !ready;
+  document.querySelectorAll("textarea[data-question], input[data-blank]").forEach((input) => {
+    input.disabled = !ready || (input.tagName === "TEXTAREA" && input.closest(".crop-text").querySelector("input[data-blank]").checked);
+  });
+}
+
+// 採点形式ラベル（app/models.py の ANSWER_FORMAT_META と対応）。essay/answer_only は表示しない。
+const FORMAT_LABELS = {
+  translation_ja: "和訳", translation_en: "英訳", composition_en: "自由英作文",
+  math_proof: "証明・数式記述", sci_derivation: "計算・導出", sci_explanation: "論述・理由説明",
+  graph: "グラフ・作図", chem_structure: "構造式",
+};
+
+function renderStatus() {
+  const area = document.getElementById("status-area");
+  area.innerHTML = "";
+  area.appendChild(statusBadge(session.status));
+  if (session.progress && ["processing", "grading"].includes(session.status)) {
+    area.appendChild(el("span", { class: "muted", text: "　" + session.progress }));
+  }
+  if (!busy) document.getElementById("grade-btn").textContent = session.status === "failed" ? "採点を再試行" : session.status === "graded" ? "保存して再採点" : "保存して採点";
+  updateControls();
+}
+
+function renderWarnings() {
+  const container = document.getElementById("warnings");
+  container.innerHTML = "";
+  if (session.error) container.appendChild(el("div", { class: "notice error", text: session.error }));
+  for (const warning of session.warnings || []) {
+    container.appendChild(el("div", { class: "notice warn", text: warning }));
+  }
+}
+
+function renderFailedPages() {
+  const panel = document.getElementById("failed-panel");
+  const list = document.getElementById("failed-list");
+  const failed = session.failed_pages || [];
+  panel.style.display = failed.length ? "block" : "none";
+  list.innerHTML = "";
+  for (const page of failed) {
+    list.appendChild(el("div", { class: "col" }, [
+      el("img", {
+        src: `/api/sessions/${encodeURIComponent(sessionId)}/failed/${encodeURIComponent(page.filename)}`,
+        alt: `位置合わせに失敗したページ: ${page.filename}`,
+        style: "max-width:220px; border:1px solid var(--border); border-radius:4px",
+      }),
+      el("div", { class: "muted", text: `${page.filename}: ${page.reason}` }),
+    ]));
+  }
+}
+
+function renderCrops() {
+  const list = document.getElementById("crop-list");
+  list.innerHTML = "";
+  if (!session.transcriptions || !session.transcriptions.length) {
+    list.appendChild(el("span", { class: "muted", text: session.status === "processing" ? "解答欄の読み取り中です。完了すると自動で表示されます。" : "転記結果がありません。ホームから解答用紙を再投入してください。" }));
+    return;
+  }
+  for (const item of session.transcriptions) {
+    const question = template ? template.questions.find((q) => q.id === item.question_id) : null;
+    const crops = (session.crops || []).filter((c) => c.question_id === item.question_id)
+      .sort((a, b) => a.index - b.index);
+
+    const images = el("div", { class: "crop-images" },
+      crops.map((crop) => el("a", {
+        href: `/api/sessions/${encodeURIComponent(sessionId)}/crops/${encodeURIComponent(crop.question_id + "_" + crop.index + ".png")}`,
+        target: "_blank", rel: "noopener", "aria-label": `${crop.question_id} の答案画像を拡大（新しいタブ）`,
+      }, el("img", {
+        src: `/api/sessions/${encodeURIComponent(sessionId)}/crops/${encodeURIComponent(crop.question_id + "_" + crop.index + ".png")}`,
+        alt: `${crop.question_id} の切り出し画像`,
+        loading: "lazy",
+      }))));
+
+    const textarea = el("textarea", { rows: "6", "data-question": item.question_id, "aria-label": `${item.question_id} の転記`, spellcheck: "false" });
+    textarea.value = item.transcription;
+    textarea.addEventListener("input", markDirty);
+
+    const blankBox = el("input", { type: "checkbox", "data-blank": item.question_id });
+    blankBox.checked = item.is_blank;
+    blankBox.addEventListener("change", () => { markDirty(); updateControls(); });
+
+    const text = el("div", { class: "crop-text" }, [
+      el("div", { class: "meta" }, [
+        el("strong", { text: `${item.question_id}${question ? "　" + (question.type || "") : ""}` }),
+        el("span", {}, [
+          question ? el("span", { class: "muted", text: `満点 ${question.max_score}　` }) : null,
+          item.transcription_edited ? el("span", { class: "badge warn", text: "転記を修正済み" }) : null,
+        ]),
+      ]),
+      textarea,
+      el("label", { class: "checkbox-inline", style: "margin-top:6px" }, [blankBox, "未記入（採点をスキップして 0 点）"]),
+    ]);
+
+    list.appendChild(el("div", { class: "crop-row" }, [images, text]));
+  }
+  updateControls();
+}
+
+async function renderResult() {
+  const panel = document.getElementById("result-panel");
+  if (session.status !== "graded" || dirty) { panel.style.display = "none"; return; }
+  let result;
+  try {
+    result = await api(`/api/sessions/${encodeURIComponent(sessionId)}/result`);
+  } catch (e) { panel.style.display = "none"; throw e; }
+  if (dirty || session.status !== "graded") return;
+
+  panel.style.display = "block";
+  const summary = document.getElementById("result-summary");
+  summary.innerHTML = "";
+  summary.appendChild(el("p", {}, [
+    el("span", { class: "score", text: `${result.total_score} / ${result.total_max_score} 点` }),
+    el("span", { class: "muted", text: `　（${result.provider} / ${result.model}）　` }),
+    el("a", { href: `/api/sessions/${encodeURIComponent(sessionId)}/graded.pdf`, text: "赤入れ PDF を開く", target: "_blank" }),
+  ]));
+  const failedCount = result.questions.filter((question) => question.score === null).length;
+  if (failedCount) summary.appendChild(el("p", { class: "notice warn", text: `${failedCount}問は採点できていません。合計点は採点できた設問のみの暫定値です。「保存して再採点」で再試行できます。` }));
+
+  const list = document.getElementById("result-list");
+  list.innerHTML = "";
+  for (const question of result.questions) {
+    const score = question.score === null ? "採点失敗" : `${question.score} / ${question.max_score}`;
+    const def = template ? template.questions.find((q) => q.id === question.id) : null;
+    const formatLabel = def ? FORMAT_LABELS[def.answer_format] : null;
+    const item = el("div", { class: "panel" }, [
+      el("div", { class: "meta", style: "display:flex; justify-content:space-between; align-items:center" }, [
+        el("strong", { text: `${question.id}　${score}` }),
+        el("span", {}, [
+          formatLabel ? el("span", { class: "badge", text: formatLabel }) : null,
+          question.confidence !== "high" ? el("span", { class: "badge warn", text: `確信度 ${question.confidence}` }) : null,
+          question.skipped_blank ? el("span", { class: "badge", text: "未記入" }) : null,
+          (!question.skipped_blank && question.grader === "deterministic") ? el("span", { class: "badge", text: "自動照合" }) : null,
+          (question.grader === "llm" && question.model && question.model !== result.model) ? el("span", { class: "badge", text: question.model }) : null,
+        ]),
+      ]),
+      question.feedback ? el("p", { class: "feedback", text: question.feedback }) : null,
+      question.model_answer_note ? el("p", { class: "feedback", text: `解答のポイント: ${question.model_answer_note}` }) : null,
+      ...question.issues.map((issue) => el("div", { class: "issue" }, [
+        el("div", {}, [
+          el("span", { class: "tag", text: issue.tag }),
+          el("span", { class: "muted", text: `（-${issue.deduction}）${issue.kind}` }),
+        ]),
+        issue.quote ? el("div", { class: "muted", text: `「${issue.quote}」` }) : null,
+        el("div", { text: issue.comment }),
+      ])),
+    ]);
+    list.appendChild(item);
+  }
+}
+
+function collectTranscriptions() {
+  return {
+    items: Array.from(document.querySelectorAll("textarea[data-question]")).map((textarea) => ({
+      question_id: textarea.dataset.question,
+      transcription: textarea.value,
+      is_blank: document.querySelector(`input[data-blank="${CSS.escape(textarea.dataset.question)}"]`).checked,
+    })),
+  };
+}
+
+async function saveTranscriptions() {
+  session = await apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/transcriptions`, "PUT", collectTranscriptions());
+  dirty = false;
+  document.getElementById("save-state").textContent = "保存済み";
+  renderCrops();
+  renderStatus();
+  if (session.status !== "graded") document.getElementById("result-panel").style.display = "none";
+  return session;
+}
+
+document.getElementById("save-btn").addEventListener("click", async () => {
+  if (busy || !editable()) return;
+  busy = true;
+  const button = document.getElementById("save-btn");
+  setBusy(button, true, "保存中…");
+  updateControls();
+  try {
+    await saveTranscriptions();
+    await renderResult();
+    showNotice(notice, "転記を保存しました。", "info");
+  } catch (e) { showNotice(notice, e.message, "error"); }
+  finally { busy = false; setBusy(button, false); renderStatus(); }
+});
+
+document.getElementById("grade-btn").addEventListener("click", async () => {
+  if (busy || !editable()) return;
+  busy = true;
+  const button = document.getElementById("grade-btn");
+  setBusy(button, true, "採点を開始中…");
+  updateControls();
+  try {
+    await saveTranscriptions();
+    await api(`/api/sessions/${encodeURIComponent(sessionId)}/grade`, { method: "POST" });
+    session.status = "grading";
+    session.progress = "採点を開始しています";
+    document.getElementById("result-panel").style.display = "none";
+    showNotice(notice, "採点を開始しました。完了までしばらくお待ちください。", "info");
+    startPolling();
+  } catch (e) {
+    showNotice(notice, e.message, "error");
+  }
+  finally { busy = false; setBusy(button, false); renderStatus(); }
+});
+
+async function refresh() {
+  session = await api(`/api/sessions/${encodeURIComponent(sessionId)}`);
+  if (!template || template.template_id !== session.template_id) {
+    try { template = await api(`/api/templates/${encodeURIComponent(session.template_id)}`); } catch (e) { template = null; }
+  }
+  document.getElementById("session-name").textContent = `${session.session_id}`;
+  renderStatus();
+  renderWarnings();
+  renderFailedPages();
+  if (!dirty) renderCrops();
+  await renderResult();
+  return session;
+}
+
+function startPolling() {
+  if (polling) clearTimeout(polling);
+  polling = setTimeout(async () => {
+    polling = null;
+    try {
+      const current = await refresh();
+      pollFailures = 0;
+      if (["processing", "grading"].includes(current.status)) startPolling();
+      else showNotice(notice, current.status === "graded" ? "採点が完了しました。下の採点結果を確認できます。" : current.status === "ready" ? "読み取りが完了しました。転記を確認して採点してください。" : "");
+    } catch (e) {
+      pollFailures += 1;
+      showNotice(notice, e.status === 404 ? e.message : `${e.message}\n接続を自動で再試行しています。`, "error");
+      if (e.status !== 404) startPolling();
+    }
+  }, Math.min(2000 * (pollFailures + 1), 15000));
+}
+
+(async function init() {
+  if (!sessionId) { showNotice(notice, "セッションが指定されていません。", "error"); return; }
+  try {
+    const current = await refresh();
+    if (["processing", "grading"].includes(current.status)) startPolling();
+  } catch (e) {
+    document.getElementById("crop-list").textContent = "転記を読み込めませんでした。ページを再読み込みするか、ホームからセッションを選び直してください。";
+    showNotice(notice, e.message, "error");
+  }
+})();
+</script>
+</body>
+</html>
