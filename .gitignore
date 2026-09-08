@@ -5,6 +5,9 @@ secrets/
 # データ（過去問原本・答案スキャンを含むためバージョン管理しない）
 data/
 
+# 配布版のログ
+logs/
+
 # Python
 .venv/
 __pycache__/

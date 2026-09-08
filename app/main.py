@@ -23,7 +23,7 @@ from app import logger as log_module
 from app import pdfutil, refs as refs_module, scanner, storage, template_builder
 from app.annotator import build_graded_pdf
 from app.config import ConfigError, MissingCredentialError, get_settings
-from app.runtime import config_dir, is_frozen, resource_dir
+from app.runtime import bind_missing_std_streams, config_dir, is_frozen, resource_dir
 from app.updater import download_and_install, latest_release
 from app.version import APP_NAME, __version__
 from app.grader import grade_session
@@ -40,6 +40,9 @@ from app.models import (
 from app.ocr import get_ocr_backend
 from app.storage import NotFoundError
 from app.registration import RegistrationPreviewRequest, RegistrationGroup, plan_registration
+
+# GUI ビルドは stdout/stderr を持たないため、ログ設定より先にファイルへ束ね直す。
+bind_missing_std_streams()
 
 # Windows の既定ロケール（cp932）のままだと日本語ログが化けるため UTF-8 に固定する。
 for _stream in (sys.stdout, sys.stderr):

@@ -190,6 +190,7 @@ npm test --prefix tests/frontend
 配布版は窓を持たないため、起動すると既定のブラウザで UI を開きます。OCR の認証情報が未設定・
 不正なときは無言で終了せず、`.env` の場所を示すダイアログを出してから終了します。起動済みの
 状態でもう一度起動した場合は、二重起動せず既存の UI をブラウザで開き直します。
+窓が無く標準出力も持たないため、サーバーのログは `%APPDATA%\KakomonTrainer\logs\app.log` に追記されます。
 
 ```dotenv
 UPDATE_REPOSITORY=GitHubユーザー名/リポジトリ名
