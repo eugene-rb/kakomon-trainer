@@ -60,7 +60,9 @@ class Settings(BaseSettings):
     grading_max_tokens: int = 8192
 
     anthropic_api_key: str = ""
-    anthropic_model: str = "claude-sonnet-5"
+    #: 記述式の採点は視覚と長い推論の複合タスクなので Opus を既定にする。
+    #: .env の ANTHROPIC_MODEL を空にしたときここへ落ちるため、.env.example と揃えておく。
+    anthropic_model: str = "claude-opus-5"
 
     openai_api_key: str = ""
     openai_model: str = ""
@@ -74,6 +76,10 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = ""
     llm_base_url: str = ""
+
+    #: 採点の system と参照資料をプロンプトキャッシュに載せるか（Anthropic のみ）。
+    #: 同じ設問を生徒の人数だけ採点するため、既定で有効にしておく価値が大きい。
+    grading_prompt_cache: bool = True
 
     # --- 採点の安定化（SPEC §9.7）---
     double_grading: bool = False

@@ -242,3 +242,209 @@ def test_anthropic_content_builder_uses_native_document(tmp_path):
     assert content[1]["type"] == "text" and "採点基準" in content[1]["text"]
     assert content[2]["type"] == "image"
     assert content[3]["text"] == "設問"
+
+
+# ---------------------------------------------------------------------------
+# プロンプトキャッシュと強制ツール呼び出しのフォールバック
+# ---------------------------------------------------------------------------
+
+CACHE_CONTROL = {"type": "ephemeral", "ttl": "1h"}
+
+
+def _md_ref(tmp_path, name="criteria.md", text="採点基準"):
+    from app.refs import RefFile
+
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return RefFile(path=path, kind="md")
+
+
+def _request(tmp_path, refs=None):
+    from app.llm.base import GradingRequest
+
+    return GradingRequest(
+        system_prompt="採点してください",
+        refs=refs if refs is not None else [_md_ref(tmp_path)],
+        crop_images=[b"\x89PNG\r\n\x1a\n"],
+        question_text="設問",
+    )
+
+
+def test_cache_breakpoint_sits_after_the_references(tmp_path):
+    """答案より前＝設問が同じなら不変の位置で区切る（生徒ごとの再送を読み出しにする）。"""
+    from app.llm.anthropic_backend import _build_content
+
+    content = _build_content(_request(tmp_path, refs=[_md_ref(tmp_path, "a.md"), _md_ref(tmp_path, "b.md")]))
+
+    cached = [i for i, part in enumerate(content) if "cache_control" in part]
+    assert cached == [1], "最後の参照資料だけに区切りを置くこと"
+    assert content[1]["cache_control"] == CACHE_CONTROL
+    assert content[-1]["text"] == "設問"
+
+
+def test_cache_breakpoint_is_omitted_without_references(tmp_path):
+    """参照資料が無ければ答案側には区切らない（可変部分をキャッシュしても無意味）。"""
+    from app.llm.anthropic_backend import _build_content
+
+    content = _build_content(_request(tmp_path, refs=[]))
+    assert all("cache_control" not in part for part in content)
+
+
+def test_prompt_cache_can_be_disabled(tmp_path):
+    from app.llm.anthropic_backend import _build_content, _build_system
+
+    content = _build_content(_request(tmp_path), prompt_cache=False)
+    assert all("cache_control" not in part for part in content)
+    assert all("cache_control" not in b for b in _build_system("sys", prompt_cache=False))
+
+
+def test_system_carries_the_cache_breakpoint():
+    from app.llm.anthropic_backend import _build_system
+
+    blocks = _build_system("sys", prompt_cache=True)
+    assert blocks == [{"type": "text", "text": "sys", "cache_control": CACHE_CONTROL}]
+
+
+def test_system_gains_a_tool_instruction_when_forcing_is_dropped():
+    """強制を外した分、ツールを呼ぶよう明示する（本文に採点を書かせない）。"""
+    from app.llm.anthropic_backend import _build_system
+
+    blocks = _build_system("sys", prompt_cache=True, force_tool_choice=False)
+    assert len(blocks) == 2
+    assert TOOL_NAME in blocks[1]["text"]
+    assert "cache_control" not in blocks[0], "区切りは最後のブロックに 1 つ"
+    assert blocks[1]["cache_control"] == CACHE_CONTROL
+
+
+def test_oversized_reference_pdf_fails_loudly(tmp_path, monkeypatch):
+    """模範解答を黙って落として採点を続けない（結果が正常に見えてしまうため）。"""
+    from app.llm import anthropic_backend
+    from app.llm.base import LLMError
+    from app.refs import RefFile
+
+    pdf = tmp_path / "huge.pdf"
+    pdf.write_bytes(b"%PDF-1.7" + b"0" * 4096)
+    monkeypatch.setattr(anthropic_backend, "_MAX_PDF_BYTES", 1024)
+
+    with pytest.raises(LLMError) as info:
+        anthropic_backend._build_content(_request(tmp_path, refs=[RefFile(path=pdf, kind="pdf")]))
+    assert "huge.pdf" in str(info.value)
+    assert ".md" in str(info.value), "回避策（.md 化）を案内すること"
+
+
+# --- grade() のフォールバック -------------------------------------------------
+
+
+class _FakeBadRequest(Exception):
+    pass
+
+
+def _tool_response(score=8):
+    from types import SimpleNamespace
+
+    block = SimpleNamespace(
+        type="tool_use",
+        name=TOOL_NAME,
+        input={"score": score, "feedback": "良い", "issues": [], "confidence": "high"},
+    )
+    return SimpleNamespace(content=[block], stop_reason="tool_use")
+
+
+def _backend(responses):
+    from types import SimpleNamespace
+
+    from app.llm.anthropic_backend import AnthropicGradingBackend
+
+    backend = AnthropicGradingBackend(api_key="sk-test", model="claude-opus-5")
+    calls: list[dict] = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        result = responses.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    backend._anthropic = SimpleNamespace(BadRequestError=_FakeBadRequest)
+    backend._client = SimpleNamespace(messages=SimpleNamespace(create=create))
+    return backend, calls
+
+
+def test_grade_forces_the_tool_and_never_disables_thinking(tmp_path):
+    backend, calls = _backend([_tool_response()])
+
+    assert backend.grade(_request(tmp_path)).score == 8
+    assert calls[0]["tool_choice"] == {"type": "tool", "name": TOOL_NAME}
+    assert "thinking" not in calls[0], "拡張思考は既定のまま（Opus 5 は思考が既定で有効）"
+
+
+def test_rejected_forced_tool_use_retries_with_auto_not_disabled_thinking(tmp_path):
+    """強制が拒否されたら思考を切るのではなく、強制のほうを取り下げる。"""
+    backend, calls = _backend([
+        _FakeBadRequest("tool_choice: `any` and `tool` are not supported with thinking"),
+        _tool_response(score=5),
+    ])
+
+    assert backend.grade(_request(tmp_path)).score == 5
+    assert len(calls) == 2
+    assert "tool_choice" not in calls[1]
+    assert "thinking" not in calls[1], "thinking: disabled は Opus 5 で採点を静かに落とす"
+    assert TOOL_NAME in calls[1]["system"][1]["text"]
+
+
+def test_forced_tool_use_stays_disabled_for_later_questions(tmp_path):
+    """一度拒否されたモデルに毎回 400 を食わせない。"""
+    backend, calls = _backend([
+        _FakeBadRequest("tool_choice is not supported for this model"),
+        _tool_response(),
+        _tool_response(),
+    ])
+
+    backend.grade(_request(tmp_path))
+    backend.grade(_request(tmp_path))
+    assert len(calls) == 3
+    assert all("tool_choice" not in call for call in calls[1:])
+
+
+def test_unrelated_bad_request_is_not_retried(tmp_path):
+    """関係のない 400 まで強制解除で握りつぶさない。"""
+    from app.llm.base import LLMError
+
+    backend, calls = _backend([_FakeBadRequest("credit balance is too low")])
+
+    with pytest.raises(LLMError, match="拒否"):
+        backend.grade(_request(tmp_path))
+    assert len(calls) == 1
+    assert backend._force_tool_choice is True
+
+
+def test_anthropic_model_defaults_to_opus(tmp_path):
+    """.env で ANTHROPIC_MODEL を空にしたとき、黙って安いモデルへ落ちない。"""
+    assert Settings(_env_file=None).anthropic_model == "claude-opus-5"
+
+
+def test_rejected_cache_control_falls_back_to_no_caching(tmp_path):
+    """キャッシュ指定が通らないモデルでも採点は続ける（キャッシュは任意の最適化）。"""
+    backend, calls = _backend([
+        _FakeBadRequest("cache_control ttl '1h' is not supported"),
+        _tool_response(score=7),
+    ])
+
+    assert backend.grade(_request(tmp_path)).score == 7
+    assert any("cache_control" in part for part in calls[0]["messages"][0]["content"])
+    assert all("cache_control" not in part for part in calls[1]["messages"][0]["content"])
+    assert calls[1]["tool_choice"] == {"type": "tool", "name": TOOL_NAME}, "強制は維持する"
+
+
+def test_both_optional_settings_can_be_dropped_in_one_call(tmp_path):
+    """キャッシュと強制ツール呼び出しの両方を拒むモデルでも、1 回の grade() で回復する。"""
+    backend, calls = _backend([
+        _FakeBadRequest("cache_control is not supported"),
+        _FakeBadRequest("tool_choice is not supported for this model"),
+        _tool_response(score=6),
+    ])
+
+    assert backend.grade(_request(tmp_path)).score == 6
+    assert len(calls) == 3
+    assert all("cache_control" not in part for part in calls[2]["messages"][0]["content"])
+    assert "tool_choice" not in calls[2]

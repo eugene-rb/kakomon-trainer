@@ -43,7 +43,10 @@ def get_grading_backend(settings: Settings) -> LLMGradingBackend:
         from app.llm.anthropic_backend import AnthropicGradingBackend
 
         return AnthropicGradingBackend(
-            api_key=api_key, model=model, max_tokens=settings.grading_max_tokens
+            api_key=api_key,
+            model=model,
+            max_tokens=settings.grading_max_tokens,
+            prompt_cache=settings.grading_prompt_cache,
         )
 
     from app.llm.openai_compatible_backend import OpenAICompatibleGradingBackend
