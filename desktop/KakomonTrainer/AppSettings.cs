@@ -10,7 +10,8 @@ public sealed class AppSettings
     public static string ConfigRoot => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KakomonTrainer");
     public string DataRoot { get; set; } = Path.Combine(ConfigRoot, "data");
     public Dictionary<string, string> Values { get; set; } = new(StringComparer.OrdinalIgnoreCase);
-    public string Get(string key, string fallback = "") => Values.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value : fallback;
+    // Trim on read as well as on save, so a key already stored with the newline a paste carried in still authenticates.
+    public string Get(string key, string fallback = "") => Values.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value) ? value.Trim() : fallback;
     public string Provider => Get("GRADING_PROVIDER", "anthropic");
     public string Prefix => Provider switch { "openai_compatible" => "LLM", _ => Provider.ToUpperInvariant() };
     public string Model => Get(Prefix + "_MODEL", Get("GRADING_MODEL"));

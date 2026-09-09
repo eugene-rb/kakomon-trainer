@@ -79,6 +79,18 @@ internal static class Program
         var settings = new AppSettings { DataRoot = root }; using var ai = new AiService(settings, store, pdf);
         var window = new MainWindow(settings, store);
         Check(window.Title == "過去問トレーナー", "WPF main window constructs");
+        var pasted = new AppSettings(); pasted.Values["ANTHROPIC_API_KEY"] = "sk-pasted-key\r\n";
+        Check(pasted.Get("ANTHROPIC_API_KEY") == "sk-pasted-key" && pasted.ApiKey == "sk-pasted-key", "whitespace pasted with a key is ignored on read");
+        var fields = (System.Windows.Controls.Panel)window.FindName("SettingFields")!;
+        var keyRow = fields.Children.OfType<System.Windows.Controls.Grid>().First(g => g.Children.OfType<System.Windows.Controls.PasswordBox>()
+            .Any(p => System.Windows.Automation.AutomationProperties.GetAutomationId(p) == "ANTHROPIC_API_KEY"));
+        var masked = keyRow.Children.OfType<System.Windows.Controls.PasswordBox>().Single();
+        var plain = keyRow.Children.OfType<System.Windows.Controls.TextBox>().Single();
+        var reveal = keyRow.Children.OfType<System.Windows.Controls.CheckBox>().Single();
+        masked.Password = "sk-pasted-key"; reveal.IsChecked = true;
+        Check(plain.Text == "sk-pasted-key" && plain.Visibility == Visibility.Visible && masked.Visibility == Visibility.Collapsed, "API key reveals for checking and copying");
+        plain.Text = "sk-edited-key"; reveal.IsChecked = false;
+        Check(masked.Password == "sk-edited-key" && masked.Visibility == Visibility.Visible && plain.Visibility == Visibility.Collapsed, "edits made while revealed become the saved key");
         window.Close();
         var scan = new ScanService(store, pdf, ai);
         var s = await scan.ScanAsync(template, inputs.ToArray(), false, new Progress<string>(Console.WriteLine), default);

@@ -360,15 +360,35 @@ public partial class MainWindow : Window
         void Field(string key, string label, string value, string[]? choices = null)
         {
             SettingFields.Children.Add(new TextBlock { Text = label });
-            Control input;
-            if (choices != null) input = new ComboBox { ItemsSource = choices, SelectedItem = value };
-            else if (key.EndsWith("_KEY")) input = new PasswordBox { Password = value, Padding = new Thickness(8), Margin = new Thickness(0, 4, 0, 10) };
-            else input = new TextBox { Text = value };
+            Control input; FrameworkElement container;
+            if (choices != null) container = input = new ComboBox { ItemsSource = choices, SelectedItem = value };
+            else if (key.EndsWith("_KEY"))
+            {
+                // Masked by default, but revealable so a pasted key can be checked and copied back out
+                // (a PasswordBox accepts paste yet refuses copy while it is masking).
+                // Match the implicit TextBox style so the row keeps its height and alignment when revealed.
+                var masked = new PasswordBox { Password = value, Padding = new Thickness(10, 7, 10, 7), MinHeight = 34, Margin = new Thickness(0, 4, 0, 0) };
+                var plain = new TextBox { Text = value, Margin = new Thickness(0, 4, 0, 0), Visibility = Visibility.Collapsed };
+                var reveal = new CheckBox { Content = "表示", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 4, 0, 0) };
+                // The PasswordBox stays the value that gets saved, so keep it in step with edits made while revealed.
+                plain.TextChanged += (_, _) => masked.Password = plain.Text;
+                reveal.Checked += (_, _) => { plain.Text = masked.Password; masked.Visibility = Visibility.Collapsed; plain.Visibility = Visibility.Visible; };
+                reveal.Unchecked += (_, _) => { plain.Visibility = Visibility.Collapsed; masked.Visibility = Visibility.Visible; };
+                System.Windows.Automation.AutomationProperties.SetName(plain, label);
+                System.Windows.Automation.AutomationProperties.SetName(reveal, label + "を表示");
+                var row = new Grid { Margin = new Thickness(0, 0, 0, 10) };
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+                row.Children.Add(masked); row.Children.Add(plain);
+                Grid.SetColumn(reveal, 1); row.Children.Add(reveal);
+                input = masked; container = row;
+            }
+            else container = input = new TextBox { Text = value };
             System.Windows.Automation.AutomationProperties.SetName(input, label);
             System.Windows.Automation.AutomationProperties.SetAutomationId(input, key);
             if (key == "APPEARANCE_THEME" && input is ComboBox themePicker)
                 themePicker.SelectionChanged += (_, _) => DesktopAppearance.Apply(themePicker.SelectedItem?.ToString() ?? "");
-            input.MinWidth = 620; settingControls[key] = input; SettingFields.Children.Add(input);
+            container.MinWidth = 620; settingControls[key] = input; SettingFields.Children.Add(container);
         }
         Field("APPEARANCE_THEME", "アプリのテーマ", settings.Get("APPEARANCE_THEME", DesktopAppearance.Choices[0]), DesktopAppearance.Choices);
         Field("DATA_ROOT", "データ保存先（既存のdataフォルダーも指定可能）", settings.DataRoot);
@@ -406,7 +426,7 @@ public partial class MainWindow : Window
     private void SaveSettings_Click(object sender, RoutedEventArgs e)
     {
         if (!ConfirmEdits()) return;
-        var values = settingControls.ToDictionary(p => p.Key, p => p.Value switch { TextBox text => text.Text.Trim(), PasswordBox password => password.Password, ComboBox combo => combo.SelectedItem?.ToString() ?? "", _ => "" });
+        var values = settingControls.ToDictionary(p => p.Key, p => p.Value switch { TextBox text => text.Text.Trim(), PasswordBox password => password.Password.Trim(), ComboBox combo => combo.SelectedItem?.ToString() ?? "", _ => "" });
         if (!System.IO.Path.IsPathFullyQualified(values["DATA_ROOT"])) throw new InvalidDataException("データ保存先は絶対パスで指定してください。");
         if (!int.TryParse(values["DOUBLE_GRADING_THRESHOLD"], out var threshold) || threshold < 1) throw new InvalidDataException("二重採点の点差は1以上の整数にしてください。");
         var replacement = new DataStore(values["DATA_ROOT"]);

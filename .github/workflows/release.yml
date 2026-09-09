@@ -21,7 +21,7 @@ jobs:
         env:
           RELEASE_REF: ${{ github.ref_name }}
         run: |
-          $version = if ($env:RELEASE_REF -match '^v\d+\.\d+\.\d+$') { $env:RELEASE_REF } else { '2.0.0' }
+          $version = if ($env:RELEASE_REF -match '^v\d+\.\d+\.\d+$') { $env:RELEASE_REF } else { '2.0.1' }
           ./scripts/build_windows.ps1 -Version $version
       - name: Write checksums
         shell: pwsh
