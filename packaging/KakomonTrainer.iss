@@ -9,6 +9,7 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 DefaultDirName={autopf}\Kakomon Trainer
 DefaultGroupName={#AppName}
+SetupIconFile=..\desktop\KakomonTrainer\Assets\app.ico
 UninstallDisplayIcon={app}\KakomonTrainer.exe
 OutputDir=..\release
 OutputBaseFilename={#OutputName}

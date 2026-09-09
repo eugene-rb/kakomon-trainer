@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Media;
+using System.Windows.Media.Imaging;
 
 namespace KakomonTrainer;
 
@@ -10,6 +11,7 @@ public sealed class PdfWindow : Window
     public PdfWindow(string title, List<byte[]> pages)
     {
         Title = title; Width = 960; Height = 850; WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        Icon = BitmapFrame.Create(new Uri("pack://application:,,,/KakomonTrainer;component/Assets/app.ico"));
         var document = new FixedDocument();
         foreach (var bytes in pages)
         {

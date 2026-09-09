@@ -55,7 +55,7 @@ dotnet publish desktop/KakomonTrainer -c Release -r win-x64 --self-contained tru
 ./scripts/build_windows.ps1 -PortableOnly
 
 # Inno Setup 6 がある場合はインストーラーも作成
-./scripts/build_windows.ps1 -Version 2.0.1
+./scripts/build_windows.ps1 -Version 2.0.2
 ```
 
 結合チェックは専用の一時フォルダーにPDFを生成し、登録、マーカー実測、180度回転・ページ入れ替え・台形補正、領域切り出し、JSON互換性、数値照合、採点、赤入れPDFの再レンダリング、転記変更後の再採点、履歴更新、キャンセルを検証します。既存データや実APIは使いません。
@@ -80,6 +80,7 @@ Get-FileHash .\KakomonTrainer-Setup.exe -Algorithm SHA256
 | `desktop/KakomonTrainer/GradingService.cs` | 数値照合、採点状態管理、復習ログ |
 | `desktop/KakomonTrainer/DataStore.cs` | 既存JSON互換、入力検証、保存 |
 | `desktop/KakomonTrainer.Checks` | ネイティブ処理の結合チェック |
+| `packaging/icon.svg` | アプリアイコンの原本。編集後に `python packaging/build-icon.py` で `app.ico` と favicon 一式を再生成します（ImageMagick が必要） |
 
 旧Python実装とそのテストは比較・移行用に残しています。新アプリと配布物からは使用しません。旧版の説明は [docs/legacy-python.md](docs/legacy-python.md) に保存しています。共通の採点プロンプトは `app/prompts/` から発行時にコピーします。
 

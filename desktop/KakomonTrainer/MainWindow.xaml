@@ -1,4 +1,4 @@
-<Window x:Class="KakomonTrainer.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="過去問トレーナー" Width="1440" Height="940" MinWidth="1080" MinHeight="720" WindowStartupLocation="CenterScreen" Closing="Window_Closing">
+<Window x:Class="KakomonTrainer.MainWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Title="過去問トレーナー" Icon="pack://application:,,,/KakomonTrainer;component/Assets/app.ico" Width="1440" Height="940" MinWidth="1080" MinHeight="720" WindowStartupLocation="CenterScreen" Closing="Window_Closing">
   <DockPanel>
     <Grid DockPanel.Dock="Top" Margin="28,20,28,22">
       <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
