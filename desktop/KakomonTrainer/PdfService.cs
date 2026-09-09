@@ -66,7 +66,17 @@ public sealed class PdfService
     {
         using var detector = new QRCodeDetector();
         var payload = detector.DetectAndDecode(image, out var points);
-        return (payload, points ?? []);
+        if (points is { Length: 4 }) return (payload, points);
+        // 300dpiでは1モジュールが5px前後しかなく、モジュール境界が非整数ピクセルに
+        // 落ちる並びのときだけ検出器がファインダパターンを見失う。2倍に拡大すると
+        // 実測した取りこぼし9件のうち8件が復帰したため、失敗時のみ再試行する。
+        using var gray = new Mat();
+        if (image.Channels() == 1) image.CopyTo(gray); else Cv2.CvtColor(image, gray, ColorConversionCodes.BGR2GRAY);
+        using var scaled = new Mat();
+        Cv2.Resize(gray, scaled, new Size(), 2, 2, InterpolationFlags.Cubic);
+        var retried = detector.DetectAndDecode(scaled, out var scaledPoints);
+        if (scaledPoints is not { Length: 4 }) return (payload, points ?? []);
+        return (retried, scaledPoints.Select(p => new Point2f(p.X / 2f, p.Y / 2f)).ToArray());
     }
     public static PageInfo Measure(byte[] image, int pageNo)
     {
@@ -87,7 +97,10 @@ public sealed class PdfService
             for (var i = 0; i < images.Count; i++)
             {
                 var info = await Task.Run(() => Measure(images[i], i + 1), token);
-                if (!new[] { 0, 1, 3 }.All(mid => info.Markers.Any(m => m.Id == mid)) || info.QrQuad.Count != 4) throw new InvalidDataException($"{i + 1}ページのマーカーを読み取れません。用紙の四隅の余白を確認してください。");
+                // マーカーとQRは失敗時の対処が違うので、どちらを読み取れなかったかを分けて伝える。
+                var missing = new[] { 0, 1, 3 }.Where(mid => !info.Markers.Any(m => m.Id == mid)).ToArray();
+                if (missing.Length > 0) throw new InvalidDataException($"{i + 1}ページのマーカー（{string.Join("・", missing)}）を読み取れません。用紙の四隅の余白を確認してください。");
+                if (info.QrQuad.Count != 4) throw new InvalidDataException($"{i + 1}ページのQRコードを読み取れません。用紙右下の余白と印刷の解像度を確認してください。");
                 template.Pages.Add(info);
             }
             store.SaveTemplate(template); return template;
