@@ -9,9 +9,16 @@ using Google.Cloud.Vision.V1;
 
 namespace KakomonTrainer;
 
-public sealed class AiService(AppSettings settings, DataStore store, PdfService pdf, HttpMessageHandler? handler = null) : IDisposable
+public sealed class AiService(AppSettings settings, DataStore store, PdfService pdf, HttpMessageHandler? handler = null, ExplanationCache? explanations = null) : IDisposable
 {
     private readonly HttpClient http = new(handler ?? new HttpClientHandler()) { Timeout = TimeSpan.FromMinutes(5) };
+    private readonly ExplanationCache explanationCache = explanations ?? new ExplanationCache();
+    private static readonly string[] SolutionHints = ["answer", "rubric", "solution", "kaisetsu", "kaito", "mohan", "解答", "解説", "採点", "模範"];
+    private static bool LooksLikeSolution(string path)
+    {
+        var name = Path.GetFileName(path).ToLowerInvariant();
+        return name.EndsWith(".md") || name.EndsWith(".txt") || SolutionHints.Any(hint => name.Contains(hint));
+    }
     public string OcrBackend => settings.Get("OCR_BACKEND", "google_vision");
     public async Task<(string Text, List<OcrWord> Words)> OcrAsync(byte[] png, CancellationToken token)
     {
@@ -107,11 +114,19 @@ public sealed class AiService(AppSettings settings, DataStore store, PdfService 
     {
         var images = new List<byte[]>(); var references = new StringBuilder();
         var root = store.TemplateDir(t.TemplateId);
-        var files = q.Refs.SelectMany(r => { var path = DataStore.Child(root, r); return Directory.Exists(path) ? Directory.GetFiles(path, "*", SearchOption.AllDirectories) : [path]; }).Distinct(StringComparer.OrdinalIgnoreCase);
+        var files = q.Refs.SelectMany(r => { var path = DataStore.Child(root, r); return Directory.Exists(path) ? Directory.GetFiles(path, "*", SearchOption.AllDirectories) : [path]; }).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         foreach (var file in files)
         {
             if (file.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)) images.AddRange(await pdf.RenderAsync(file, 120, token));
             else if (new[] { ".md", ".txt" }.Contains(Path.GetExtension(file).ToLowerInvariant())) references.AppendLine(await File.ReadAllTextAsync(file, token));
+        }
+        // Local model answers / rubric come first; fall back to indexed web notes only when none are attached.
+        if (!files.Any(LooksLikeSolution))
+        {
+            var meta = ExamMeta.From(t);
+            var webNotes = meta.IsComplete ? explanationCache.Lookup(meta, q.Id) : null;
+            if (webNotes != null)
+                references.AppendLine("【ネット情報にもとづく参考メモ（模範解答の骨子。ローカルの解答解説が無いため補助的に使用。逐語の正解ではない）】").AppendLine(webNotes);
         }
         foreach (var crop in s.Crops.Where(c => c.QuestionId == q.Id).OrderBy(c => c.Index)) images.Add(await File.ReadAllBytesAsync(DataStore.Child(Path.Combine(store.SessionDir(s.SessionId), "crops"), crop.Filename), token));
         var prompts = Path.Combine(AppContext.BaseDirectory, "prompts");
@@ -145,5 +160,176 @@ public sealed class AiService(AppSettings settings, DataStore store, PdfService 
     private static readonly JsonObject GradeSchema = JsonNode.Parse("""
     {"type":"object","properties":{"score":{"type":"integer"},"feedback":{"type":"string"},"confidence":{"type":"string","enum":["high","medium","low"]},"issues":{"type":"array","items":{"type":"object","properties":{"quote":{"type":"string"},"kind":{"type":"string"},"tag":{"type":"string"},"comment":{"type":"string"},"deduction":{"type":"integer"}},"required":["quote","kind","tag","comment","deduction"],"additionalProperties":false}}},"required":["score","feedback","confidence","issues"],"additionalProperties":false}
     """)!.AsObject();
+
+    /// <summary>
+    /// 問題用紙（あれば）とウェブ検索から、過去問の問題構成・種別・配点を推定する。
+    /// Anthropic のサーバーサイド Web 検索ツールを使うため、GRADING_PROVIDER によらず ANTHROPIC_API_KEY を用いる。
+    /// </summary>
+    public async Task<StructureProposal> ProposeStructureAsync(ExamMeta meta, IReadOnlyList<string> problemFiles, ScoringPrinciple? cached, IProgress<string> progress, CancellationToken token)
+    {
+        var key = settings.Get("ANTHROPIC_API_KEY");
+        var model = settings.Get("ANTHROPIC_MODEL", "claude-opus-5");
+        if (key.Length == 0 || model.Length == 0)
+            throw new InvalidOperationException("配点の自動取得には Anthropic の APIキーとモデル名が必要です。設定で入力してください。");
+
+        progress.Report("問題用紙を読み込み中…");
+        var images = new List<byte[]>();
+        foreach (var file in problemFiles)
+        {
+            token.ThrowIfCancellationRequested();
+            if (file.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)) images.AddRange(await pdf.RenderAsync(file, 130, token));
+            else if (new[] { ".png", ".jpg", ".jpeg" }.Contains(Path.GetExtension(file).ToLowerInvariant())) images.Add(await File.ReadAllBytesAsync(file, token));
+            if (images.Count >= 15) break;
+        }
+        images = images.Take(15).ToList();
+
+        var system = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "prompts", "structure_system.md"));
+        var prompt = new StringBuilder();
+        prompt.AppendLine($"対象の過去問: {meta.Describe()}");
+        prompt.AppendLine($"大学={meta.University} / 年度={meta.Year} / 文理={(meta.Track.Length == 0 ? "指定なし" : meta.Track)} / 科目={meta.Subject}");
+        prompt.AppendLine();
+        if (cached != null && cached.Principle.Length > 0)
+        {
+            prompt.AppendLine("## 既知の配点原則（出発点。当該年度の問題用紙と最新情報で必ず検証すること）");
+            prompt.AppendLine(cached.Principle);
+            if (cached.TypicalTotal > 0) prompt.AppendLine($"想定満点: {cached.TypicalTotal}");
+            if (cached.YearsObserved.Count > 0) prompt.AppendLine($"確認済みの年度: {string.Join(", ", cached.YearsObserved)}");
+            prompt.AppendLine();
+        }
+        prompt.AppendLine(images.Count > 0
+            ? $"添付はこの過去問の問題用紙（{images.Count}ページ）。問題構成（大問・小問・内容・順序）はこの問題用紙を第一の根拠とすること。"
+            : "問題用紙の添付はない。問題構成もウェブ検索で推定し、推定であることを summary と confidence に明示すること。");
+        prompt.AppendLine("配点は web_search で予備校の入試分析・過去問解説などから調べること。");
+        prompt.AppendLine();
+        prompt.AppendLine("answer_format は次から必ず1つ選ぶ:");
+        foreach (var format in Formats.All) prompt.AppendLine($"  - {format.Key}: {format.Value}");
+        prompt.AppendLine();
+        prompt.AppendLine("各設問の explanation_notes には、採点に使える模範解答の骨子・押さえるべき論点・ありがちな誤りを、自分の言葉で3〜6行にまとめること（予備校の解答をそのまま書き写さない）。手がかりが無ければ空文字にする。");
+        prompt.AppendLine("調査後、必ず submit_structure ツールを呼んで結果を提出すること。");
+
+        var content = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = prompt.ToString() });
+        foreach (var image in images)
+            content.Add(new JsonObject { ["type"] = "image", ["source"] = new JsonObject { ["type"] = "base64", ["media_type"] = image.Length >= 2 && image[0] == 0xff && image[1] == 0xd8 ? "image/jpeg" : "image/png", ["data"] = Convert.ToBase64String(image) } });
+        var messages = new JsonArray(new JsonObject { ["role"] = "user", ["content"] = content });
+        var structureTool = new JsonObject { ["name"] = "submit_structure", ["description"] = "調べた問題構成と配点を提出する", ["input_schema"] = StructureSchema() };
+        var body = new JsonObject
+        {
+            ["model"] = model,
+            ["max_tokens"] = 12000,
+            ["system"] = system,
+            ["messages"] = messages,
+            ["tools"] = new JsonArray(new JsonObject { ["type"] = "web_search_20250305", ["name"] = "web_search", ["max_uses"] = 6 }, structureTool.DeepClone()),
+        };
+
+        progress.Report("ウェブで配点・出題分析を調査中…");
+        JsonNode first;
+        try { first = await PostAnthropic(key, body, token); }
+        catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.BadRequest)
+        {
+            throw new InvalidOperationException("配点の自動取得に失敗しました。モデル名が正しいか、Anthropic コンソールで「ウェブ検索ツール」が有効かを確認してください。", ex);
+        }
+        for (var continuation = 0; first["stop_reason"]?.ToString() == "pause_turn"; continuation++)
+        {
+            if (continuation >= 5) throw new InvalidDataException("ウェブ調査が完了しませんでした。条件を確認して再実行してください。");
+            progress.Report("ウェブ調査を継続中…");
+            messages.Add(new JsonObject { ["role"] = "assistant", ["content"] = first["content"]!.DeepClone() });
+            first = await PostAnthropic(key, body, token);
+        }
+        if (first["stop_reason"]?.ToString() == "max_tokens")
+            throw new InvalidDataException("配点の自動取得結果が長すぎて途中で切れました。条件を絞って再実行してください。");
+        var proposal = ExtractStructure(first);
+        if (proposal == null)
+        {
+            // The model replied in prose without calling submit_structure; ask again with the tool forced.
+            progress.Report("調査結果を整理中…");
+            messages.Add(new JsonObject { ["role"] = "assistant", ["content"] = first["content"]!.DeepClone() });
+            messages.Add(new JsonObject { ["role"] = "user", ["content"] = "上記の調査結果を submit_structure ツールで提出してください。" });
+            var followup = new JsonObject
+            {
+                ["model"] = model,
+                ["max_tokens"] = 12000,
+                ["system"] = system,
+                ["messages"] = messages.DeepClone(),
+                ["tools"] = body["tools"]!.DeepClone(),
+                ["tool_choice"] = new JsonObject { ["type"] = "tool", ["name"] = "submit_structure" },
+            };
+            proposal = ExtractStructure(await PostAnthropic(key, followup, token)) ?? throw new InvalidDataException("配点の自動取得結果を解釈できませんでした。");
+        }
+        if (proposal.Questions.Count == 0) throw new InvalidDataException("問題構成を特定できませんでした。大学・年度・科目を確認してください。");
+        return proposal;
+    }
+
+    private async Task<JsonNode> PostAnthropic(string key, JsonObject body, CancellationToken token)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
+            request.Headers.Add("x-api-key", key); request.Headers.Add("anthropic-version", "2023-06-01");
+            request.Content = new StringContent(body.ToJsonString(), Encoding.UTF8, "application/json");
+            using var response = await http.SendAsync(request, token);
+            if (attempt < 2 && (response.StatusCode == HttpStatusCode.TooManyRequests || (int)response.StatusCode >= 500)) { await Task.Delay(TimeSpan.FromSeconds(2 << attempt), token); continue; }
+            await EnsureSuccess(response, token);
+            return JsonNode.Parse(await response.Content.ReadAsStringAsync(token))!;
+        }
+    }
+
+    private static StructureProposal? ExtractStructure(JsonNode response)
+    {
+        var block = response["content"]?.AsArray().FirstOrDefault(b => b?["type"]?.ToString() == "tool_use" && b?["name"]?.ToString() == "submit_structure");
+        if (block == null) return null;
+        var json = block["input"]!.ToJsonString();
+        using var parsed = JsonDocument.Parse(json);
+        foreach (var required in new[] { "questions", "sources", "confidence", "summary" })
+            if (!parsed.RootElement.TryGetProperty(required, out _)) throw new InvalidDataException("配点の自動取得結果に必須項目がありません。");
+        var proposal = JsonSerializer.Deserialize<StructureProposal>(json, DataStore.Json)
+            ?? throw new InvalidDataException("配点の自動取得結果が空です。");
+        if (proposal.Questions == null || proposal.Sources == null || proposal.Summary == null
+            || proposal.AbstractedPrinciple == null || proposal.TypicalTotal < 0
+            || proposal.Confidence is not ("high" or "medium" or "low")
+            || proposal.Questions.Any(q => q == null || q.MaxScore < 0))
+            throw new InvalidDataException("配点の自動取得結果に不正な値があります。");
+        return proposal;
+    }
+
+    private static JsonObject StructureSchema()
+    {
+        var formats = new JsonArray();
+        foreach (var format in Formats.All.Keys) formats.Add(format);
+        return new JsonObject
+        {
+            ["type"] = "object",
+            ["properties"] = new JsonObject
+            {
+                ["questions"] = new JsonObject
+                {
+                    ["type"] = "array",
+                    ["items"] = new JsonObject
+                    {
+                        ["type"] = "object",
+                        ["properties"] = new JsonObject
+                        {
+                            ["id"] = new JsonObject { ["type"] = "string" },
+                            ["type"] = new JsonObject { ["type"] = "string" },
+                            ["max_score"] = new JsonObject { ["type"] = "integer" },
+                            ["answer_format"] = new JsonObject { ["type"] = "string", ["enum"] = formats },
+                            ["explanation_notes"] = new JsonObject { ["type"] = "string" },
+                            ["explanation_sources"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+                        },
+                        ["required"] = new JsonArray("id", "type", "max_score", "answer_format"),
+                        ["additionalProperties"] = false,
+                    },
+                },
+                ["sources"] = new JsonObject { ["type"] = "array", ["items"] = new JsonObject { ["type"] = "string" } },
+                ["confidence"] = new JsonObject { ["type"] = "string", ["enum"] = new JsonArray("high", "medium", "low") },
+                ["summary"] = new JsonObject { ["type"] = "string" },
+                ["abstracted_principle"] = new JsonObject { ["type"] = "string" },
+                ["typical_total"] = new JsonObject { ["type"] = "integer" },
+            },
+            ["required"] = new JsonArray("questions", "sources", "confidence", "summary", "abstracted_principle", "typical_total"),
+            ["additionalProperties"] = false,
+        };
+    }
+
     public void Dispose() => http.Dispose();
 }

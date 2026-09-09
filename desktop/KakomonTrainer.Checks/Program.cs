@@ -48,6 +48,12 @@ internal static class Program
         Check(groups.Count == 1 && groups[0].References.Count == 2, "registration pairing");
         Reject(() => Registration.Plan(["C:/exam_answers.pdf"]), "orphan reference rejected");
         Reject(() => Registration.Plan(["C:/a.pdf", "D:/A.pdf"]), "duplicate filename rejected");
+        var (parsed1, missing1) = ExamNaming.Parse("07kyoto_21_zenki_kagaku");
+        Check(parsed1.University == "京都大学" && parsed1.Year == 2021 && parsed1.Subject == "化学" && missing1.Count == 0, "exam metadata parsed from filename");
+        var (parsed2, _) = ExamNaming.Parse("kyodai_2020_bunkei_sugaku");
+        Check(parsed2.Track == "文系" && parsed2.Year == 2020 && parsed2.Subject == "数学", "exam metadata parses track and four-digit year");
+        var (_, missing3) = ExamNaming.Parse("random-file");
+        Check(missing3.Contains("大学") && missing3.Contains("年度") && missing3.Contains("科目"), "unparseable filename reports every missing field");
         var old = JsonSerializer.Deserialize<Transcription>("{\"question_id\":\"Q1\",\"transcription\":\"既存の答案\",\"custom\":42}", DataStore.Json)!;
         Check(old.TranscriptionText == "既存の答案" && JsonSerializer.Serialize(old, DataStore.Json).Contains("\"custom\": 42"), "legacy transcription and extension data");
         var store = new DataStore(root); var pdf = new PdfService();
@@ -79,6 +85,17 @@ internal static class Program
         var settings = new AppSettings { DataRoot = root }; using var ai = new AiService(settings, store, pdf);
         var window = new MainWindow(settings, store);
         Check(window.Title == "過去問トレーナー", "WPF main window constructs");
+        var editingField = typeof(MainWindow).GetField("editing", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var applyMethod = typeof(MainWindow).GetMethod("ApplyStructure", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        var draft = new Template { Questions = [new Question { Id = "Q1", MaxScore = 7, Regions = [new Region { PageNo = 1, Rect = [0.1, 0.1, 0.2, 0.2] }] }] };
+        editingField.SetValue(window, draft);
+        var original = draft.Questions[0];
+        applyMethod.Invoke(window, [new StructureProposal { Questions = [new ProposedQuestion { Id = "Q1", MaxScore = 99 }, new ProposedQuestion { Id = "Q2", MaxScore = 5 }] }, false]);
+        Check(draft.Questions.Count == 2 && ReferenceEquals(draft.Questions[0], original) && original.MaxScore == 7 && original.Regions.Count == 1, "add-only structure preserves existing scores and regions");
+        try { applyMethod.Invoke(window, [new StructureProposal { Questions = [new ProposedQuestion { Id = "a/b" }] }, true]); throw new Exception("Invalid replacement accepted"); }
+        catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is InvalidDataException)
+        { Check(draft.Questions.Count == 2 && ReferenceEquals(draft.Questions[0], original), "invalid replacement preserves existing questions"); }
+        editingField.SetValue(window, null);
         var pasted = new AppSettings(); pasted.Values["ANTHROPIC_API_KEY"] = "sk-pasted-key\r\n";
         Check(pasted.Get("ANTHROPIC_API_KEY") == "sk-pasted-key" && pasted.ApiKey == "sk-pasted-key", "whitespace pasted with a key is ignored on read");
         var fields = (System.Windows.Controls.Panel)window.FindName("SettingFields")!;
@@ -125,6 +142,7 @@ internal static class Program
         try { await grader.SaveResult(template, s, second, cts.Token); throw new Exception("Save cancellation not observed"); }
         catch (OperationCanceledException) { Check(s.Status == "ready" && store.Result(s) == null, "failed result save hides incomplete output"); }
         await CheckApiContracts(store, pdf, template, s);
+        await CheckStructureContract(store, pdf, root);
         Console.WriteLine($"All {count} checks passed. Artifacts: {root}");
     }
     private static async Task CheckApiContracts(DataStore store, PdfService pdf, Template template, Session session)
@@ -158,6 +176,116 @@ internal static class Program
         using var failedAi = new AiService(failureSettings, store, pdf, new StubHandler(_ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = new StringContent("do-not-expose-provider-response") })));
         try { await failedAi.GradeQuestion(template, session, question, transcription, default); throw new Exception("401 not surfaced"); }
         catch (HttpRequestException ex) { Check(ex.StatusCode == HttpStatusCode.Unauthorized && !ex.Message.Contains("do-not-expose"), "API failure sanitized and surfaced"); }
+    }
+    private static async Task CheckStructureContract(DataStore store, PdfService pdf, string root)
+    {
+        var settings = new AppSettings();
+        settings.Values["ANTHROPIC_API_KEY"] = "fake-test-key";
+        settings.Values["ANTHROPIC_MODEL"] = "fake-test-model";
+        var meta = new ExamMeta("京都大学", 2021, "理系", "化学");
+        var cached = new ScoringPrinciple { Principle = "大問4題・各25点・計100点。", TypicalTotal = 100, YearsObserved = [2020] };
+        const string payload = """
+        {"questions":[
+          {"id":"大問1","type":"理論化学","max_score":25,"answer_format":"sci_derivation","explanation_notes":"平衡定数を圧平衡で立式する。","explanation_sources":["https://example.com/kaisetsu"]},
+          {"id":"a/b","type":"無機化学","max_score":25,"answer_format":"essay"},
+          {"id":"大問3","type":"有機化学","max_score":50,"answer_format":"weird_format"}],
+         "sources":["https://example.com/haiten","既知の配点原則"],
+         "confidence":"medium","summary":"予備校2社の推定が一致。","abstracted_principle":"大問4題・各25点。","typical_total":100}
+        """;
+        var calls = 0;
+        var handler = new StubHandler(async request =>
+        {
+            calls++;
+            Check(request.RequestUri!.AbsoluteUri == "https://api.anthropic.com/v1/messages", "structure request goes to Anthropic");
+            var body = JsonNode.Parse(await request.Content!.ReadAsStringAsync())!;
+            var tools = body["tools"]!.AsArray();
+            Check(tools.Any(t => t?["type"]?.ToString() == "web_search_20250305"), "structure request enables web search");
+            Check(tools.Any(t => t?["name"]?.ToString() == "submit_structure"), "structure request offers submit_structure");
+            var text = body["messages"]![0]!["content"]![0]!["text"]!.ToString();
+            Check(text.Contains("京都大学") && text.Contains("2021") && text.Contains("化学"), "structure prompt carries the exam metadata");
+            Check(text.Contains("大問4題・各25点・計100点"), "structure prompt injects the cached principle");
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(new JsonObject
+                {
+                    ["content"] = new JsonArray(
+                        new JsonObject { ["type"] = "server_tool_use", ["id"] = "srv_1", ["name"] = "web_search", ["input"] = new JsonObject { ["query"] = "京大 化学 2021 配点" } },
+                        new JsonObject { ["type"] = "web_search_tool_result", ["tool_use_id"] = "srv_1", ["content"] = new JsonArray() },
+                        new JsonObject { ["type"] = "tool_use", ["id"] = "toolu_1", ["name"] = "submit_structure", ["input"] = JsonNode.Parse(payload) }),
+                    ["stop_reason"] = "tool_use",
+                }.ToJsonString()),
+            };
+        });
+        using var ai = new AiService(settings, store, pdf, handler);
+        var proposal = await ai.ProposeStructureAsync(meta, Array.Empty<string>(), cached, new Progress<string>(Console.WriteLine), default);
+        Check(calls == 1, "structure needs a single call when the tool is used");
+        Check(proposal.Questions.Count == 3 && proposal.TypicalTotal == 100 && proposal.AbstractedPrinciple.Length > 0, "structure proposal parsed");
+        Check(proposal.Questions[0].ExplanationNotes.Length > 0, "per-question explanation notes parsed");
+
+        var text2Calls = 0;
+        var proseThenTool = new StubHandler(request =>
+        {
+            text2Calls++;
+            var forced = text2Calls == 2;
+            var content = forced
+                ? new JsonArray(new JsonObject { ["type"] = "tool_use", ["id"] = "toolu_2", ["name"] = "submit_structure", ["input"] = JsonNode.Parse(payload) })
+                : new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "調べた結果は次のとおりです（本文）。" });
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(new JsonObject { ["content"] = content, ["stop_reason"] = forced ? "tool_use" : "end_turn" }.ToJsonString()),
+            });
+        });
+        using var ai2 = new AiService(settings, store, pdf, proseThenTool);
+        var recovered = await ai2.ProposeStructureAsync(meta, Array.Empty<string>(), null, new Progress<string>(Console.WriteLine), default);
+        Check(text2Calls == 2 && recovered.Questions.Count == 3, "structure falls back to a forced submit_structure call");
+
+        var pausedCalls = 0;
+        var pausedHandler = new StubHandler(async request =>
+        {
+            pausedCalls++;
+            var body = JsonNode.Parse(await request.Content!.ReadAsStringAsync())!;
+            if (pausedCalls == 2)
+            {
+                Check(body["messages"]!.AsArray().Count == 2 && body["messages"]![1]!["role"]!.ToString() == "assistant", "paused search resumes without a new user turn");
+                Check(body["tools"]!.AsArray().Any(t => t?["name"]?.ToString() == "web_search"), "paused search preserves server tools");
+            }
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(new JsonObject
+                {
+                    ["content"] = pausedCalls == 1
+                        ? new JsonArray(new JsonObject { ["type"] = "server_tool_use", ["id"] = "srv_pause", ["name"] = "web_search", ["input"] = new JsonObject { ["query"] = "京都大学 化学 配点" } })
+                        : new JsonArray(new JsonObject { ["type"] = "tool_use", ["id"] = "toolu_resume", ["name"] = "submit_structure", ["input"] = JsonNode.Parse(payload) }),
+                    ["stop_reason"] = pausedCalls == 1 ? "pause_turn" : "tool_use",
+                }.ToJsonString()),
+            };
+        });
+        using var pausedAi = new AiService(settings, store, pdf, pausedHandler);
+        Check((await pausedAi.ProposeStructureAsync(meta, [], null, new Progress<string>(), default)).Questions.Count == 3 && pausedCalls == 2, "paused search completes");
+
+        foreach (var invalid in new[] { payload.Replace("\"max_score\":25", "\"max_score\":-1"), payload.Replace("\"confidence\":\"medium\"", "\"confidence\":null"), payload.Replace("\"sources\":[\"https://example.com/haiten\",\"既知の配点原則\"]", "\"sources\":null") })
+        {
+            using var invalidAi = new AiService(settings, store, pdf, new StubHandler(_ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(new JsonObject { ["content"] = new JsonArray(new JsonObject { ["type"] = "tool_use", ["name"] = "submit_structure", ["input"] = JsonNode.Parse(invalid) }) }.ToJsonString()),
+            })));
+            try { await invalidAi.ProposeStructureAsync(meta, [], null, new Progress<string>(), default); throw new Exception("Invalid structure accepted"); }
+            catch (InvalidDataException) { Check(true, "invalid structure rejected before applying"); }
+        }
+
+        var principlePath = Path.Combine(root, "principles.json");
+        var principles = new ScoringPrincipleCache(principlePath);
+        principles.Update(meta, proposal.AbstractedPrinciple, proposal.TypicalTotal, proposal.Sources);
+        Check(new ScoringPrincipleCache(principlePath).Lookup(meta)?.TypicalTotal == 100, "scoring principle persists and reloads");
+        Check(new ScoringPrincipleCache(principlePath).Lookup(new ExamMeta("京都大学", 2022, "", "化学")) != null, "principle lookup ignores year and track as a fallback");
+        principles.Clear();
+        Check(new ScoringPrincipleCache(principlePath).Count == 0, "learned principle cache clears");
+
+        var notesPath = Path.Combine(root, "explanations.json");
+        var explanations = new ExplanationCache(notesPath);
+        explanations.Store(meta, [new ExplanationNote { QuestionId = "大問1", Notes = "圧平衡で立式する。" }]);
+        Check(new ExplanationCache(notesPath).Lookup(meta, "大問1") == "圧平衡で立式する。", "web explanation note persists per exam and question");
+        Check(new ExplanationCache(notesPath).Lookup(new ExamMeta("京都大学", 2020, "理系", "化学"), "大問1") == null, "explanation note is scoped to the year");
     }
     private sealed class StubHandler(Func<HttpRequestMessage, Task<HttpResponseMessage>> response) : HttpMessageHandler
     {

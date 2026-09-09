@@ -13,6 +13,11 @@ public class Template : Extensible
     public int SchemaVersion { get; set; } = 2;
     public string TemplateId { get; set; } = "";
     public string Title { get; set; } = "";
+    // 過去問の特定に使う。登録時にファイル名から自動設定し、編集画面で修正できる。
+    public string University { get; set; } = "";
+    public int ExamYear { get; set; }
+    public string Track { get; set; } = ""; // 文系 / 理系 / 共通 / ""
+    public string Subject { get; set; } = "";
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.Now;
     public string SourcePdf { get; set; } = "source.pdf";
     public string BlankPdf { get; set; } = "blank.pdf";
@@ -148,4 +153,34 @@ public static class Formats
         ["translation_en"] = "英訳", ["composition_en"] = "自由英作文", ["math_proof"] = "証明・数式記述",
         ["sci_derivation"] = "計算・導出", ["sci_explanation"] = "論述・理由説明", ["graph"] = "グラフ・作図", ["chem_structure"] = "構造式"
     };
+}
+
+// 過去問1件を一意に指す情報。ネット検索と配点キャッシュのキーになる。
+public sealed record ExamMeta(string University, int Year, string Track, string Subject)
+{
+    [JsonIgnore] public bool IsComplete => University.Length > 0 && Year > 0 && Subject.Length > 0;
+    [JsonIgnore] public string CacheKey => $"{University}|{Track}|{Subject}";
+    public string Describe() => string.Join(" ", new[] { University, Year > 0 ? Year + "年度" : "", Track, Subject }.Where(s => s.Length > 0));
+    public static ExamMeta From(Template t) => new(t.University, t.ExamYear, t.Track, t.Subject);
+}
+
+// AiService.ProposeStructureAsync の戻り値。submit_structure ツールの出力をそのまま受ける。
+public sealed class StructureProposal
+{
+    public List<ProposedQuestion> Questions { get; set; } = [];
+    public List<string> Sources { get; set; } = [];
+    public string Confidence { get; set; } = "low";
+    public string Summary { get; set; } = "";
+    public string AbstractedPrinciple { get; set; } = "";
+    public int TypicalTotal { get; set; }
+}
+public sealed class ProposedQuestion
+{
+    public string Id { get; set; } = "";
+    public string Type { get; set; } = "";
+    public int MaxScore { get; set; }
+    public string AnswerFormat { get; set; } = "essay";
+    // ローカルに解答解説が無い設問の採点補助に使う、ネット情報を要約したメモ。
+    public string ExplanationNotes { get; set; } = "";
+    public List<string> ExplanationSources { get; set; } = [];
 }

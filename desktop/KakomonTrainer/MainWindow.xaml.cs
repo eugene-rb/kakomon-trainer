@@ -16,6 +16,8 @@ public partial class MainWindow : Window
     private readonly AppSettings settings;
     private DataStore store;
     private readonly PdfService pdf = new();
+    private readonly ScoringPrincipleCache principles = new();
+    private readonly ExplanationCache explanations = new();
     private AiService ai;
     private Template? editing;
     private Template? sessionTemplate;
@@ -33,7 +35,7 @@ public partial class MainWindow : Window
 
     public MainWindow(AppSettings settings, DataStore store)
     {
-        this.settings = settings; this.store = store; ai = new AiService(settings, store, pdf);
+        this.settings = settings; this.store = store; ai = new AiService(settings, store, pdf, explanations: explanations);
         InitializeComponent(); FormatBox.ItemsSource = Formats.All;
         BuildSettings(); RefreshLibrary();
         Closed += (_, _) => { ai.Dispose(); operation?.Dispose(); };
@@ -80,6 +82,13 @@ public partial class MainWindow : Window
                 try
                 {
                     var t = await pdf.RegisterAsync(store, group.Sheet, group.Title, token);
+                    var (meta, unresolved) = ExamNaming.Parse(group.Title);
+                    if (unresolved.Count > 0)
+                    {
+                        var dialog = new MetadataDialog(group.Title, meta, unresolved) { Owner = this };
+                        if (dialog.ShowDialog() == true && dialog.Result != null) meta = dialog.Result;
+                    }
+                    t.University = meta.University; t.ExamYear = meta.Year; t.Track = meta.Track; t.Subject = meta.Subject;
                     foreach (var reference in group.References)
                     {
                         var relative = "refs/" + System.IO.Path.GetFileName(reference); File.Copy(reference, DataStore.Child(store.TemplateDir(t.TemplateId), relative)); t.DefaultRefs.Add(relative);
@@ -99,11 +108,23 @@ public partial class MainWindow : Window
         {
             var t = store.LoadTemplate(SelectedTemplate().TemplateId);
             var pages = await pdf.RenderAsync(DataStore.Child(store.TemplateDir(t.TemplateId), t.BlankPdf), 120, token);
-            editing = t; editorPages = pages; pageIndex = 0; TitleBox.Text = t.Title; QuestionList.ItemsSource = t.Questions;
+            editing = t; editorPages = pages; pageIndex = 0; QuestionList.ItemsSource = t.Questions;
+            TitleBox.Text = t.Title; UniversityBox.Text = t.University; YearBox.Text = t.ExamYear > 0 ? t.ExamYear.ToString() : "";
+            TrackBox.SelectedValue = t.Track.Length == 0 ? "指定なし" : t.Track; SubjectBox.Text = t.Subject;
             savedTemplate = TemplateSnapshot(); ShowEditorPage(); GoTab(1); QuestionList.SelectedIndex = t.Questions.Count > 0 ? 0 : -1;
         });
     }
-    private string TemplateSnapshot() { if (editing == null) return ""; editing.Title = TitleBox.Text; return Snapshot(editing); }
+    private string TemplateSnapshot() { if (editing == null) return ""; ApplyMetadata(); return Snapshot(editing); }
+    private void ApplyMetadata()
+    {
+        if (editing == null) return;
+        editing.Title = TitleBox.Text.Trim();
+        editing.University = UniversityBox.Text.Trim();
+        editing.Subject = SubjectBox.Text.Trim();
+        var track = TrackBox.SelectedValue as string ?? "指定なし";
+        editing.Track = track == "指定なし" ? "" : track;
+        editing.ExamYear = int.TryParse(YearBox.Text.Trim(), out var year) && year is >= 1990 and <= 2100 ? year : 0;
+    }
     private bool HasValidationErrors(DependencyObject parent)
     {
         if (Validation.GetHasError(parent)) return true;
@@ -114,8 +135,9 @@ public partial class MainWindow : Window
     {
         if (editing == null) return;
         if (HasValidationErrors(QuestionForm)) throw new InvalidDataException("配点と許容誤差の入力を確認してください。");
-        editing.Title = TitleBox.Text;
+        ApplyMetadata();
         if (string.IsNullOrWhiteSpace(editing.Title)) throw new InvalidDataException("用紙名を入力してください。");
+        if (YearBox.Text.Trim().Length > 0 && editing.ExamYear == 0) throw new InvalidDataException("年度は1990〜2100の西暦で入力してください。");
         store.SaveTemplate(editing); savedTemplate = TemplateSnapshot(); StatusText.Text = "用紙を保存しました。"; RefreshLibrary();
     }
     private void SaveTemplate_Click(object sender, RoutedEventArgs e) => SaveTemplate();
@@ -193,6 +215,135 @@ public partial class MainWindow : Window
             Directory.CreateDirectory(System.IO.Path.GetDirectoryName(target)!); File.Copy(file, target); q.Refs.Add(relative);
         }
         QuestionForm.DataContext = null; QuestionForm.DataContext = q;
+    }
+    private void AttachProblemSheets_Click(object sender, RoutedEventArgs e)
+    {
+        if (editing == null) { MessageBox.Show(this, "先に「用紙を編集」で用紙を開いてください。", "用紙が未選択です"); return; }
+        var files = PickFiles("問題用紙PDF|*.pdf", true); if (files == null) return;
+        var added = 0;
+        foreach (var file in files)
+        {
+            var name = System.IO.Path.GetFileName(file); var relative = "refs/" + name; var target = DataStore.Child(store.TemplateDir(editing.TemplateId), relative);
+            if (File.Exists(target)) { relative = "refs/" + Guid.NewGuid().ToString("N")[..6] + "-" + name; target = DataStore.Child(store.TemplateDir(editing.TemplateId), relative); }
+            Directory.CreateDirectory(System.IO.Path.GetDirectoryName(target)!); File.Copy(file, target);
+            if (!editing.DefaultRefs.Contains(relative)) { editing.DefaultRefs.Add(relative); added++; }
+        }
+        // Existing questions should also see the newly attached problem sheets when grading.
+        foreach (var question in editing.Questions)
+            foreach (var reference in editing.DefaultRefs)
+                if (!question.Refs.Contains(reference)) question.Refs.Add(reference);
+        if (QuestionList.SelectedItem is Question selected) { QuestionForm.DataContext = null; QuestionForm.DataContext = selected; }
+        StatusText.Text = $"問題用紙を{added}件添付しました。「保存」で確定します。";
+        MessageBox.Show(this, $"問題用紙を{added}件添付し、採点時の参照資料にも追加しました。「保存」を押すと確定します。", "問題用紙の添付");
+    }
+    private async void AutoScore_Click(object sender, RoutedEventArgs e)
+    {
+        if (editing == null) { MessageBox.Show(this, "先に「用紙を編集」で用紙を開いてください。", "用紙が未選択です"); return; }
+        ApplyMetadata();
+        var meta = ExamMeta.From(editing);
+        if (!meta.IsComplete)
+        {
+            var unresolved = new List<string>();
+            if (meta.University.Length == 0) unresolved.Add("大学");
+            if (meta.Year == 0) unresolved.Add("年度");
+            if (meta.Subject.Length == 0) unresolved.Add("科目");
+            var dialog = new MetadataDialog(editing.Title, meta, unresolved) { Owner = this };
+            if (dialog.ShowDialog() != true || dialog.Result == null) return;
+            meta = dialog.Result;
+            UniversityBox.Text = meta.University; YearBox.Text = meta.Year.ToString();
+            TrackBox.SelectedValue = meta.Track.Length == 0 ? "指定なし" : meta.Track; SubjectBox.Text = meta.Subject;
+            ApplyMetadata();
+        }
+        var problemFiles = editing.DefaultRefs
+            .Select(r => DataStore.Child(store.TemplateDir(editing.TemplateId), r))
+            .Where(p => File.Exists(p) && p.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (problemFiles.Count == 0 && MessageBox.Show(this,
+            "問題用紙PDFが添付されていません。問題構成はウェブ検索の推定のみになり、精度が下がります。このまま続けますか？",
+            "問題用紙が未添付です", MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+
+        var replaceAll = false;
+        if (editing.Questions.Count > 0)
+        {
+            var choice = MessageBox.Show(this,
+                "既存の設問があります。\n\n［はい］すべて置き換える（描画済みの解答領域も削除されます）\n［いいえ］不足している設問だけ追加する\n［キャンセル］中止",
+                "配点・構成の自動設定", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+            if (choice == MessageBoxResult.Cancel) return;
+            replaceAll = choice == MessageBoxResult.Yes;
+        }
+
+        var cached = principles.Lookup(meta);
+        var current = editing;
+        await Run(async token =>
+        {
+            var proposal = await ai.ProposeStructureAsync(meta, problemFiles, cached, Progress(), token);
+            var (applied, skipped) = ApplyStructure(proposal, replaceAll);
+            DrawRegions(); QuestionList.Items.Refresh();
+            QuestionList.SelectedIndex = current.Questions.Count > 0 ? 0 : -1;
+
+            var savePrinciple = proposal.Confidence != "low";
+            if (!savePrinciple && proposal.AbstractedPrinciple.Length > 0)
+                savePrinciple = MessageBox.Show(this, $"確信度が低い結果です。次回の参考にする配点原則を保存しますか？\n\n{proposal.AbstractedPrinciple}",
+                    "配点原則の保存", MessageBoxButton.YesNo) == MessageBoxResult.Yes;
+            if (savePrinciple) principles.Update(meta, proposal.AbstractedPrinciple, proposal.TypicalTotal, proposal.Sources);
+
+            var webNotes = proposal.Questions
+                .Where(pq => (pq.Id ?? "").Trim().Length > 0 && !string.IsNullOrWhiteSpace(pq.ExplanationNotes))
+                .Select(pq => new ExplanationNote { QuestionId = pq.Id!.Trim(), Notes = pq.ExplanationNotes.Trim(), Sources = pq.ExplanationSources ?? [] })
+                .ToList();
+            if (webNotes.Count > 0) explanations.Store(meta, webNotes);
+
+            var lines = new List<string> { $"{applied}件の設問を{(replaceAll ? "設定" : "追加")}しました。確信度: {proposal.Confidence}" };
+            if (skipped.Count > 0) lines.Add($"使用できない設問IDのためスキップ: {string.Join(", ", skipped)}");
+            if (webNotes.Count > 0) lines.Add($"ネット解答解説メモを{webNotes.Count}件保存しました（ローカルに解答解説が無い設問の採点で参考にします）。");
+            var total = current.Questions.Sum(q => q.MaxScore);
+            if (proposal.TypicalTotal > 0 && total != proposal.TypicalTotal)
+                lines.Add($"配点合計 {total} 点が想定満点 {proposal.TypicalTotal} 点と一致しません。内容を確認してください。");
+            if (current.Questions.Any(q => q.MaxScore == 0)) lines.Add("配点が0点の設問があります。");
+            if (cached != null) lines.Add("キャッシュ済みの配点原則を参考にしました。");
+            if (savePrinciple) lines.Add("配点原則をキャッシュに保存しました。");
+            lines.Add(""); lines.Add(proposal.Summary);
+            if (proposal.Sources.Count > 0) { lines.Add(""); lines.Add("出典:"); lines.AddRange(proposal.Sources.Select(s => "・" + s)); }
+            MessageBox.Show(this, string.Join("\n", lines), "配点・構成の自動設定");
+            StatusText.Text = $"配点・構成を自動設定しました（{applied}件）。内容を確認して「保存」を押してください。";
+        });
+    }
+    private (int Applied, List<string> Skipped) ApplyStructure(StructureProposal proposal, bool replaceAll)
+    {
+        if (editing == null) return (0, []);
+        var known = new HashSet<string>(replaceAll ? [] : editing.Questions.Select(q => q.Id), StringComparer.OrdinalIgnoreCase);
+        var additions = new List<Question>();
+        var applied = 0; var skipped = new List<string>();
+        foreach (var proposed in proposal.Questions)
+        {
+            var id = (proposed.Id ?? "").Trim();
+            if (id.Length == 0) { skipped.Add("(空のID)"); continue; }
+            try { DataStore.ValidateId(id); } catch { skipped.Add(id); continue; }
+            if (!known.Add(id)) continue; // add-only: leave an existing question and its regions untouched
+            additions.Add(new Question
+            {
+                Id = id,
+                Type = (proposed.Type ?? "").Trim(),
+                MaxScore = Math.Max(0, proposed.MaxScore),
+                AnswerFormat = Formats.All.ContainsKey(proposed.AnswerFormat ?? "") ? proposed.AnswerFormat! : "essay",
+                Refs = [.. editing.DefaultRefs],
+            });
+            applied++;
+        }
+        if (replaceAll && additions.Count == 0)
+            throw new InvalidDataException("使用できる設問がないため、既存の設問は変更しませんでした。");
+        if (replaceAll) editing.Questions.Clear();
+        foreach (var question in additions) editing.Questions.Add(question);
+        return (applied, skipped);
+    }
+    private void ClearLearnedCache_Click(object sender, RoutedEventArgs e)
+    {
+        var total = principles.Count + explanations.Count;
+        if (total == 0) { MessageBox.Show(this, "学習キャッシュは空です。", "AIの学習キャッシュ"); return; }
+        if (MessageBox.Show(this, $"保存済みの配点原則 {principles.Count} 件とネット解答解説メモ {explanations.Count} 件を削除します。よろしいですか？",
+            "AIの学習キャッシュ", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
+        {
+            principles.Clear(); explanations.Clear(); MessageBox.Show(this, "削除しました。", "AIの学習キャッシュ");
+        }
     }
     private async void Blank_Click(object sender, RoutedEventArgs e) => await Run(async token => { var t = SelectedTemplate(); await ShowPdf(DataStore.Child(store.TemplateDir(t.TemplateId), t.BlankPdf), t.Title, token); });
     private async Task ShowPdf(string path, string title, CancellationToken token)
@@ -409,6 +560,8 @@ public partial class MainWindow : Window
         Field("DOUBLE_GRADING_THRESHOLD", "二重採点で要確認とする点差", settings.Get("DOUBLE_GRADING_THRESHOLD", "3"));
         Field("UPDATE_REPOSITORY", "更新用GitHubリポジトリ（owner/repository）", settings.Get("UPDATE_REPOSITORY"));
         var update = new Button { Content = "アプリの更新を確認", HorizontalAlignment = HorizontalAlignment.Left }; update.Click += Update_Click; SettingFields.Children.Add(update);
+        var clearCache = new Button { Content = "AIの学習キャッシュを削除（配点原則・ネット解答解説）", HorizontalAlignment = HorizontalAlignment.Left, Margin = new Thickness(0, 8, 0, 0) };
+        clearCache.Click += ClearLearnedCache_Click; SettingFields.Children.Add(clearCache);
     }
     private async void Update_Click(object sender, RoutedEventArgs e)
     {
@@ -431,7 +584,7 @@ public partial class MainWindow : Window
         if (!int.TryParse(values["DOUBLE_GRADING_THRESHOLD"], out var threshold) || threshold < 1) throw new InvalidDataException("二重採点の点差は1以上の整数にしてください。");
         var replacement = new DataStore(values["DATA_ROOT"]);
         foreach (var pair in values) settings.Values[pair.Key] = pair.Value;
-        settings.DataRoot = replacement.Root; settings.Save(); DesktopAppearance.Apply(settings.Get("APPEARANCE_THEME")); ai.Dispose(); store = replacement; ai = new AiService(settings, store, pdf);
+        settings.DataRoot = replacement.Root; settings.Save(); DesktopAppearance.Apply(settings.Get("APPEARANCE_THEME")); ai.Dispose(); store = replacement; ai = new AiService(settings, store, pdf, explanations: explanations);
         editing = null; session = null; sessionTemplate = null; result = null; editorPages.Clear(); SheetImage.Source = null; QuestionList.ItemsSource = null; TranscriptionList.ItemsSource = null; CropImages.Children.Clear(); DrawRegions(); ShowResult();
         RefreshLibrary(); StatusText.Text = "設定を保存しました。";
     }

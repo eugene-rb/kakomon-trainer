@@ -20,7 +20,14 @@
           <DockPanel Margin="0,0,16,0"><StackPanel DockPanel.Dock="Top" Orientation="Horizontal"><Button Content="前ページ" Click="PreviousPage_Click"/><TextBlock x:Name="PageLabel" Text="用紙を選んで「用紙を編集」を押してください" VerticalAlignment="Center" Margin="12,0"/><Button Content="次ページ" Click="NextPage_Click"/></StackPanel><TextBlock DockPanel.Dock="Bottom" Text="設問を選び、画像をドラッグして解答領域を追加します。複数領域は追加順で読み取ります。" TextWrapping="Wrap" Margin="4,12"/><ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"><Grid HorizontalAlignment="Left" VerticalAlignment="Top"><Image x:Name="SheetImage" Stretch="Fill"/><Canvas x:Name="RegionCanvas" Background="Transparent" MouseLeftButtonDown="Region_Down" MouseMove="Region_Move" MouseLeftButtonUp="Region_Up"/></Grid></ScrollViewer></DockPanel>
           <ScrollViewer Grid.Column="1" VerticalScrollBarVisibility="Auto"><StackPanel>
             <TextBlock Text="用紙名"/><TextBox x:Name="TitleBox"/>
-            <StackPanel Orientation="Horizontal"><Button Content="設問を追加" Click="AddQuestion_Click"/><Button Content="設問を削除" Click="DeleteQuestion_Click"/><Button Content="保存" Style="{StaticResource PrimaryButton}" Click="SaveTemplate_Click"/></StackPanel>
+            <Grid Margin="0,6,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions>
+              <StackPanel Margin="0,0,10,0"><TextBlock Text="大学"/><TextBox x:Name="UniversityBox"/></StackPanel>
+              <StackPanel Grid.Column="1"><TextBlock Text="年度（西暦）"/><TextBox x:Name="YearBox"/></StackPanel></Grid>
+            <Grid Margin="0,4,0,0"><Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition/></Grid.ColumnDefinitions>
+              <StackPanel Margin="0,0,10,0"><TextBlock Text="文理"/><ComboBox x:Name="TrackBox" SelectedValuePath="Content"><ComboBoxItem Content="指定なし"/><ComboBoxItem Content="文系"/><ComboBoxItem Content="理系"/><ComboBoxItem Content="共通"/></ComboBox></StackPanel>
+              <StackPanel Grid.Column="1"><TextBlock Text="科目"/><TextBox x:Name="SubjectBox"/></StackPanel></Grid>
+            <StackPanel Orientation="Horizontal" Margin="0,8,0,0"><Button Content="問題用紙PDFを添付" Click="AttachProblemSheets_Click"/><Button Content="配点・構成を自動設定" Click="AutoScore_Click"/></StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,4,0,0"><Button Content="設問を追加" Click="AddQuestion_Click"/><Button Content="設問を削除" Click="DeleteQuestion_Click"/><Button Content="保存" Style="{StaticResource PrimaryButton}" Click="SaveTemplate_Click"/></StackPanel>
             <ListBox x:Name="QuestionList" Height="110" DisplayMemberPath="Id" SelectionChanged="Question_Changed" Margin="0,8"/>
             <StackPanel x:Name="QuestionForm">
               <TextBlock Text="設問ID"/><TextBox Text="{Binding Id, UpdateSourceTrigger=PropertyChanged}"/>
