@@ -176,6 +176,7 @@ public sealed class StructureProposal
 }
 public sealed class ProposedQuestion
 {
+    public QuestionRubric? Rubric { get; set; }
     public string Id { get; set; } = "";
     public string Type { get; set; } = "";
     public int MaxScore { get; set; }

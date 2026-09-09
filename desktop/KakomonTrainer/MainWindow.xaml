@@ -27,6 +27,7 @@
               <StackPanel Margin="0,0,10,0"><TextBlock Text="文理"/><ComboBox x:Name="TrackBox" SelectedValuePath="Content"><ComboBoxItem Content="指定なし"/><ComboBoxItem Content="文系"/><ComboBoxItem Content="理系"/><ComboBoxItem Content="共通"/></ComboBox></StackPanel>
               <StackPanel Grid.Column="1"><TextBlock Text="科目"/><TextBox x:Name="SubjectBox"/></StackPanel></Grid>
             <StackPanel Orientation="Horizontal" Margin="0,8,0,0"><Button Content="問題用紙PDFを添付" Click="AttachProblemSheets_Click"/><Button Content="配点・構成を自動設定" Click="AutoScore_Click"/></StackPanel>
+            <WrapPanel><Button Content="問題別採点基準を調査" Click="ResearchRubrics_Click"/><Button Content="選択設問の採点基準" Click="ShowRubric_Click"/></WrapPanel>
             <StackPanel Orientation="Horizontal" Margin="0,4,0,0"><Button Content="設問を追加" Click="AddQuestion_Click"/><Button Content="設問を削除" Click="DeleteQuestion_Click"/><Button Content="保存" Style="{StaticResource PrimaryButton}" Click="SaveTemplate_Click"/></StackPanel>
             <ListBox x:Name="QuestionList" Height="110" DisplayMemberPath="Id" SelectionChanged="Question_Changed" Margin="0,8"/>
             <StackPanel x:Name="QuestionForm">

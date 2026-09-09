@@ -291,9 +291,11 @@ public partial class MainWindow : Window
                 .Select(pq => new ExplanationNote { QuestionId = pq.Id!.Trim(), Notes = pq.ExplanationNotes.Trim(), Sources = pq.ExplanationSources ?? [] })
                 .ToList();
             if (webNotes.Count > 0) explanations.Store(meta, webNotes);
+            var indexed = explanations.IndexRubrics(meta, proposal.Questions, current.Questions.Select(q => q.Id));
 
             var lines = new List<string> { $"{applied}件の設問を{(replaceAll ? "設定" : "追加")}しました。確信度: {proposal.Confidence}" };
             if (skipped.Count > 0) lines.Add($"使用できない設問IDのためスキップ: {string.Join(", ", skipped)}");
+            lines.Add($"当該年度の問題別採点基準を{indexed}件保存しました。「選択設問の採点基準」で確認できます。");
             if (webNotes.Count > 0) lines.Add($"ネット解答解説メモを{webNotes.Count}件保存しました（ローカルに解答解説が無い設問の採点で参考にします）。");
             var total = current.Questions.Sum(q => q.MaxScore);
             if (proposal.TypicalTotal > 0 && total != proposal.TypicalTotal)
@@ -306,6 +308,47 @@ public partial class MainWindow : Window
             MessageBox.Show(this, string.Join("\n", lines), "配点・構成の自動設定");
             StatusText.Text = $"配点・構成を自動設定しました（{applied}件）。内容を確認して「保存」を押してください。";
         });
+    }
+    private async void ResearchRubrics_Click(object sender, RoutedEventArgs e)
+    {
+        if (editing == null) return;
+        ApplyMetadata();
+        var current = editing;
+        var meta = ExamMeta.From(current);
+        if (!meta.IsComplete || current.Questions.Count == 0)
+        {
+            MessageBox.Show(this, "大学・年度・科目と、調査対象の設問を入力してください。", "問題別採点基準");
+            return;
+        }
+        await Run(async token =>
+        {
+            foreach (var q in current.Questions) DataStore.ValidateId(q.Id);
+            if (current.Questions.Select(q => q.Id).Distinct(StringComparer.OrdinalIgnoreCase).Count() != current.Questions.Count)
+                throw new InvalidDataException("設問IDが重複しています。");
+            var files = current.DefaultRefs.Select(r => DataStore.Child(store.TemplateDir(current.TemplateId), r))
+                .Where(p => File.Exists(p) && p.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)).ToList();
+            var proposal = await ai.ProposeStructureAsync(meta, files, null, Progress(), token, current.Questions.ToList());
+            token.ThrowIfCancellationRequested();
+            var indexed = explanations.IndexRubrics(meta, proposal.Questions, current.Questions.Select(q => q.Id));
+            var report = $"{indexed}/{current.Questions.Count}件の問題別採点基準を取得・保存しました。\n対象年度・設問に対応する根拠を取得できなかった設問の基準は更新していません。\n設問構成・配点・解答領域は維持しています。\n\n{proposal.Summary}";
+            StatusText.Text = $"問題別採点基準を{indexed}件保存しました。";
+            MessageBox.Show(this, report, "問題別採点基準");
+        });
+    }
+    private void ShowRubric_Click(object sender, RoutedEventArgs e)
+    {
+        if (editing == null || QuestionList.SelectedItem is not Question q) return;
+        ApplyMetadata();
+        var meta = ExamMeta.From(editing);
+        var rubric = explanations.LookupRubric(meta, q.Id);
+        var viewer = new Window
+        {
+            Owner = this, Title = $"{meta.Describe()} / {q.Id} の採点基準", Width = 700, Height = 600,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            Content = new TextBox { Text = rubric?.Describe() ?? "当該年度・設問の採点基準は未取得です。「問題別採点基準を調査」で取得してください。",
+                IsReadOnly = true, TextWrapping = TextWrapping.Wrap, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new Thickness(16) },
+        };
+        viewer.Show();
     }
     private (int Applied, List<string> Skipped) ApplyStructure(StructureProposal proposal, bool replaceAll)
     {

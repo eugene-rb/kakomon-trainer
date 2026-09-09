@@ -198,6 +198,15 @@ internal static class Program
         """;
         var question = new Question { Id = "Q1", AnswerFormat = "essay", MaxScore = 10 };
         var transcription = new Transcription { QuestionId = "Q1", TranscriptionText = "答案" };
+        template.University = "京都大学"; template.ExamYear = 2021; template.Track = "理系"; template.Subject = "化学";
+        var indexed = new ExplanationCache(Path.Combine(store.Root, "grading-rubrics.json"));
+        var rubricMeta = ExamMeta.From(template);
+        indexed.IndexRubrics(rubricMeta, [new ProposedQuestion { Id = "Q1", Rubric = TestRubric(2021) }, new ProposedQuestion { Id = "Q2", Rubric = TestRubric(2021, "OTHER-QUESTION") }], ["Q1", "Q2"]);
+        indexed.IndexRubrics(rubricMeta with { Year = 2020 }, [new ProposedQuestion { Id = "Q1", Rubric = TestRubric(2020, "OTHER-YEAR") }], ["Q1"]);
+        var localReference = "refs/local-rubric.md";
+        Directory.CreateDirectory(Path.Combine(store.TemplateDir(template.TemplateId), "refs"));
+        File.WriteAllText(DataStore.Child(store.TemplateDir(template.TemplateId), localReference), "LOCAL-RUBRIC");
+        question.Refs.Add(localReference);
         foreach (var provider in new[] { "anthropic", "openai", "kimi", "openai_compatible" })
         {
             var settings = new AppSettings(); settings.Values["GRADING_PROVIDER"] = provider;
@@ -206,6 +215,8 @@ internal static class Program
             {
                 var body = JsonNode.Parse(await request.Content!.ReadAsStringAsync())!;
                 Check(body["model"]!.ToString() == "fake-test-model" && body["tools"]!.AsArray().Count == 1, provider + " structured tool request");
+                var prompt = body["messages"]!.AsArray().Last()!["content"]![0]!["text"]!.ToString();
+                Check(prompt.Contains("REQUIRED-EQUILIBRIUM") && prompt.Contains("https://example.com/2021/solution") && prompt.Contains("LOCAL-RUBRIC") && !prompt.Contains("OTHER-QUESTION") && !prompt.Contains("OTHER-YEAR"), provider + " uses only the indexed exam/question rubric alongside local references");
                 var sent = body["messages"]!.AsArray().Last()!["content"]!.AsArray().Last()!;
                 var encoded = provider == "anthropic" ? sent["source"]!["data"]!.ToString() : sent["image_url"]!["url"]!.ToString().Split(',')[1];
                 var crop = session.Crops.First(c => c.QuestionId == question.Id);
@@ -218,7 +229,7 @@ internal static class Program
                 Check(request.Headers.Authorization?.Scheme == "Bearer" && request.RequestUri!.AbsolutePath.EndsWith("/chat/completions"), provider + " bearer and endpoint");
                 return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(new JsonObject { ["choices"] = new JsonArray(new JsonObject { ["message"] = new JsonObject { ["tool_calls"] = new JsonArray(new JsonObject { ["function"] = new JsonObject { ["arguments"] = grade } }) } }) }.ToJsonString()) };
             });
-            using var ai = new AiService(settings, store, pdf, handler);
+            using var ai = new AiService(settings, store, pdf, handler, indexed);
             var result = await ai.GradeQuestion(template, session, question, transcription, default);
             Check(result.Score == 8 && result.Issues.Count == 1, provider + " structured response parsed");
         }
@@ -254,6 +265,9 @@ internal static class Program
             var text = body["messages"]![0]!["content"]![0]!["text"]!.ToString();
             Check(text.Contains("京都大学") && text.Contains("2021") && text.Contains("化学"), "structure prompt carries the exam metadata");
             Check(text.Contains("大問4題・各25点・計100点"), "structure prompt injects the cached principle");
+            Check(text.Contains("IDは完全一致") && text.Contains("大問1") && body["system"]!.ToString().Contains("記事の公開年ではない"), "rubric research targets exact question IDs and exam year");
+            var structuredPayload = JsonNode.Parse(payload)!;
+            structuredPayload["questions"]![0]!["rubric"] = JsonSerializer.SerializeToNode(TestRubric(2021), DataStore.Json);
             return new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new StringContent(new JsonObject
@@ -261,13 +275,14 @@ internal static class Program
                     ["content"] = new JsonArray(
                         new JsonObject { ["type"] = "server_tool_use", ["id"] = "srv_1", ["name"] = "web_search", ["input"] = new JsonObject { ["query"] = "京大 化学 2021 配点" } },
                         new JsonObject { ["type"] = "web_search_tool_result", ["tool_use_id"] = "srv_1", ["content"] = new JsonArray() },
-                        new JsonObject { ["type"] = "tool_use", ["id"] = "toolu_1", ["name"] = "submit_structure", ["input"] = JsonNode.Parse(payload) }),
+                        new JsonObject { ["type"] = "tool_use", ["id"] = "toolu_1", ["name"] = "submit_structure", ["input"] = structuredPayload }),
                     ["stop_reason"] = "tool_use",
                 }.ToJsonString()),
             };
         });
         using var ai = new AiService(settings, store, pdf, handler);
-        var proposal = await ai.ProposeStructureAsync(meta, Array.Empty<string>(), cached, new Progress<string>(Console.WriteLine), default);
+        var proposal = await ai.ProposeStructureAsync(meta, Array.Empty<string>(), cached, new Progress<string>(Console.WriteLine), default, [new Question { Id = "大問1", MaxScore = 25 }]);
+        Check(proposal.Questions[0].Rubric?.IsValidFor(meta) == true, "web research response parses structured per-question rubric");
         Check(calls == 1, "structure needs a single call when the tool is used");
         Check(proposal.Questions.Count == 3 && proposal.TypicalTotal == 100 && proposal.AbstractedPrinciple.Length > 0, "structure proposal parsed");
         Check(proposal.Questions[0].ExplanationNotes.Length > 0, "per-question explanation notes parsed");
@@ -336,7 +351,23 @@ internal static class Program
         explanations.Store(meta, [new ExplanationNote { QuestionId = "大問1", Notes = "圧平衡で立式する。" }]);
         Check(new ExplanationCache(notesPath).Lookup(meta, "大問1") == "圧平衡で立式する。", "web explanation note persists per exam and question");
         Check(new ExplanationCache(notesPath).Lookup(new ExamMeta("京都大学", 2020, "理系", "化学"), "大問1") == null, "explanation note is scoped to the year");
+        var rubric = TestRubric(2021);
+        Check(explanations.IndexRubrics(meta, [new ProposedQuestion { Id = "大問1", Rubric = rubric }], ["大問1"]) == 1, "question rubric indexed independently of general principles");
+        var reloaded = new ExplanationCache(notesPath);
+        Check(reloaded.LookupRubric(meta, "大問1")?.RequiredPoints.Single() == "REQUIRED-EQUILIBRIUM" && reloaded.Lookup(meta, "大問1") != null, "structured rubric persists and preserves legacy explanation");
+        Check(reloaded.LookupRubric(meta with { Year = 2020 }, "大問1") == null && reloaded.LookupRubric(meta with { Track = "文系" }, "大問1") == null && reloaded.LookupRubric(meta, "大問2") == null, "rubric lookup never falls back across years tracks or questions");
+        Check(explanations.IndexRubrics(meta, [new ProposedQuestion { Id = "大問1", Rubric = TestRubric(2020) }, new ProposedQuestion { Id = "unknown", Rubric = rubric }], ["大問1"]) == 0, "wrong-year and unknown-question rubrics are not indexed");
+        var unsourced = TestRubric(2021); unsourced.Sources = [];
+        Check(explanations.IndexRubrics(meta, [new ProposedQuestion { Id = "大問1", Rubric = unsourced }], ["大問1"]) == 0 && explanations.LookupRubric(meta, "大問1") != null, "missing sources do not overwrite an existing rubric");
+        Check(explanations.IndexRubrics(meta, [new ProposedQuestion { Id = "大問1", Rubric = rubric }, new ProposedQuestion { Id = "大問1", Rubric = rubric }], ["大問1"]) == 0, "ambiguous duplicate rubric IDs rejected");
+        explanations.Clear();
+        Check(new ExplanationCache(notesPath).LookupRubric(meta, "大問1") == null, "clear removes indexed rubrics");
     }
+    private static QuestionRubric TestRubric(int year, string point = "REQUIRED-EQUILIBRIUM") => new()
+    {
+        SourceYear = year, ExpectedAnswer = "平衡定数から導出する", RequiredPoints = [point], PartialCredit = ["立式までの部分点は推定"],
+        CommonErrors = ["単位の不整合"], Basis = "解説から推定した基準。公式の配点は不明。", Confidence = "medium", Sources = [$"https://example.com/{year}/solution"],
+    };
     private sealed class StubHandler(Func<HttpRequestMessage, Task<HttpResponseMessage>> response) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => response(request);
