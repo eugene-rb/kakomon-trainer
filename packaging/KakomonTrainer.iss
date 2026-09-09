@@ -21,8 +21,7 @@ CloseApplications=yes
 RestartApplications=no
 
 [Files]
-Source: "..\dist\KakomonTrainer.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\.env.example"; DestDir: "{userappdata}\KakomonTrainer"; DestName: ".env"; Flags: onlyifdoesntexist
+Source: "..\artifacts\desktop\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\KakomonTrainer.exe"

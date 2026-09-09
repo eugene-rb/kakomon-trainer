@@ -25,3 +25,10 @@ graphify-out/
 Thumbs.db
 .vscode/
 .idea/
+
+# .NET / WPF build outputs
+**/bin/
+**/obj/
+.vs/
+artifacts/
+*.user

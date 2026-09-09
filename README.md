@@ -1,207 +1,86 @@
-# 模試自動採点システム
+# 過去問トレーナー — WPF / .NET 9
 
-紙の模試・問題集の解答用紙をスキャンし、OCR と LLM で自動採点・添削する。
-出力は **赤入れ済み PDF** と **復習用ログ**（JSONL + Markdown）。
-シングルユーザー・ローカル実行（`127.0.0.1` バインド固定）。
+紙の答案を取り込み、転記確認・自動採点・赤入れPDF・復習ログの作成まで行うWindowsデスクトップアプリです。画面と処理をC#へ移植しました。ブラウザ、WebView、Python、ローカルHTTPサーバーは使用しません。
 
-## セットアップ
+Windows 11のFluentデザインを採用し、左側ナビゲーション、角丸のコントロール、Mica背景、Windowsのアクセント色に対応しています。テーマは既定でWindowsに追従し、「設定」からライト／ダークを選択できます。
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-# OCR に Azure Document Intelligence を使う場合のみ
-# pip install -r requirements-optional.txt
+## 起動
 
-copy .env.example .env    # 値を埋める（下記）
-```
+ビルド済みの場合は `artifacts/desktop/KakomonTrainer.exe` を実行してください。配布ZIPは解凍し、同じフォルダーにあるDLL・Assets・promptsを残したままEXEを実行します。自己完結型のため、配布先に.NETを別途インストールする必要はありません。
 
-### `.env` の必須項目
-
-| 項目 | 説明 |
-|---|---|
-| `GOOGLE_APPLICATION_CREDENTIALS` | GCP サービスアカウント JSON のパス。既定は `./secrets/gcp-vision-credentials.json` |
-| `GRADING_PROVIDER` | `anthropic` / `openai` / `kimi` / `openai_compatible` |
-| `<PROVIDER>_API_KEY` | 採点に使うプロバイダの API キー |
-| `<PROVIDER>_MODEL` | 使用モデル名（プロバイダ別変数が共通の `GRADING_MODEL` より優先される） |
-
-**OCR の認証情報は起動時に必須**（無ければ起動を中止する）。
-**採点用の API キーは起動をブロックしない** — 未設定なら起動時に警告を出し、
-記述式設問の採点実行時に HTTP 503 と日本語メッセージで返す。キーが無くても
-テンプレート作成〜OCR 転記までは使える。**「答えのみ」設問だけのテンプレートは
-採点キー無しでも採点できる**（決定的な照合で完結するため）。
-
-### 起動
+開発環境では次のコマンドで発行・起動できます。
 
 ```powershell
-python -m app.main
-# または: uvicorn app.main:app --host 127.0.0.1 --port 8765
+./Start-KakomonTrainer.ps1
 ```
 
-ブラウザで http://127.0.0.1:8765/ を開く。
+Windows 10 2004以降 / Windows 11のx64環境が対象です。ソースからのビルドには.NET 9以降のSDKを使用します。ターゲットは `net9.0-windows10.0.19041.0` です。
+
+```powershell
+dotnet build KakomonTrainer.sln -c Release
+dotnet publish desktop/KakomonTrainer -c Release -r win-x64 --self-contained true -o artifacts/desktop
+```
 
 ## 使い方
 
-### ファイル名で用紙と解答解説をまとめて登録
+1. **用紙・答案**で「用紙と解説を登録」を押します。用紙はPDF、解説・採点基準はPDF / Markdown / テキストです。`exam_sheet.pdf`、`exam_answers.pdf`、`exam_rubric.md` のように共通名で対応付けます。用紙単独のPDFも登録できます。対応表の確認後、ArUcoマーカー3個とQR付きの印刷用PDFを生成します。
+2. **用紙・領域の編集**で設問を追加し、用紙画像をドラッグして解答領域を指定します。設問ごとに複数ページ・複数領域を指定できます。配点、採点形式、正答、数値許容誤差、言語、指示、参照資料を保存します。
+3. 「印刷用PDF」を独自ウィンドウで開き、ツールバーから印刷します。記入後、四隅を切らずに300dpi以上でスキャンしてください。
+4. 用紙を選び「答案を取り込む」でPDFまたは画像を選びます。QRでページ順と用紙を確認し、回転・台形歪みを補正します。**答案1組ずつ**取り込みます。OCRのチェックを外せば、外部APIなしで手入力の転記ができます。
+5. **転記の確認**で切り出し画像と文字を見比べ、読み取りミスを修正します。未記入の設問はチェックを付けます。「保存して採点」で採点します。
+6. **採点結果・復習**で得点・講評・誤りを確認します。未確定の設問は合計に含めず明示します。得点は手動修正して保存できます。赤入れPDFはアプリ内で表示・印刷でき、ファイルにも書き出せます。講評はPDFの末尾に収録し、単語座標のあるOCRでは該当引用に下線を入れます。
 
-詳細な動作・命名規則・API・受け入れ条件は、[解答用紙登録・解答解説自動対応付け仕様書](docs/answer-sheet-registration.md)を参照してください。
+転記を変更して保存すると、以前の採点結果は再採点まで非表示になります。未保存の用紙・転記・点数の変更は画面移動・終了時に確認します。長時間処理中は操作をロックし、「処理を中止」でキャンセルできます。
 
-ホームの「解答用紙を登録」で、用紙と解説をまとめて選択・ドロップできます。
-ファイル名は半角英数字と `_` / `-` / `.` を使い、共通名の末尾に役割を付けます。
+## 設定とデータ
 
-| ファイル名の例 | 役割 |
-|---|---|
-| `kyodai_english_2024_sheet.pdf` | 白紙の解答用紙 |
-| `kyodai_english_2024_answers.pdf` | 解答解説 |
-| `kyodai_english_2024_rubric.md` | 採点基準 |
+アプリの「設定」から保存先、OCRプロバイダ、APIキー、モデル名、APIベースURL、更新リポジトリを指定します。
 
-共通名が一致する資料だけを対応付けます。大文字・小文字は区別しません。
-解説と採点基準は PDF / Markdown / テキストに対応します。用紙だけの登録や、
-役割の末尾を付けない単独PDF（`exam.pdf`）の登録もできます。
-複数組を選ぶと対応関係が表示され、登録前に確認できます。対応先のない資料や
-重複した用紙は登録前にエラーになります。一部のPDFの登録が失敗した場合は、
-成功した用紙を残して失敗分だけ再試行できます。
+- OCR: Google Cloud Vision / Azure Document Intelligence / Claude Vision
+- 記述・画像採点: Anthropic / OpenAI / Kimi / OpenAI互換API
+- 答えのみ: 正規化・分数・百分率・指数・単位・許容誤差による照合。曖昧な表記は設定に応じてClaudeへ確認し、未確定なら手動で点数を確定できます。
+- 二重採点: 記述式を独立に2回採点し、設定した点差以上なら要確認にします。
+- APIキー未設定でも起動・用紙編集・手動転記・数値照合は利用できます。
 
-対応付けた資料は、領域エディタで設問を追加するときに自動選択されます。
-設問ごとの参照資料チェックは変更できます。設問番号・ページごとの自動切り分けは
-行わず、用紙全体の解説として対応付けます。同じ名前の用紙を再登録すると別の
-管理用IDを自動生成し、既存の用紙は上書きしません。
+設定は `%LOCALAPPDATA%/KakomonTrainer/desktop-settings.bin` にWindows DPAPIで暗号化して保存します。開発チェックアウトでは既存の `.env` と `data/` を初期値に使います。既存の設定値を画面から上書きできます。
 
-### 採点までの流れ
+配布版の既定データ保存先は `%LOCALAPPDATA%/KakomonTrainer/data` です。旧版のデータを使う場合は「設定」で既存の `data` フォルダーを指定してください。**スキーマv2のテンプレート・答案・採点結果を読み込み、未知のJSONフィールドも保持します。** v1の用紙は物理レイアウトが異なるため再登録が必要です。
 
-1. **テンプレート作成** — 白紙の解答用紙 PDF をアップロードすると、左上・右上・左下の
-   ArUco マーカー 3 個と右下のページ識別用 QR（この 4 隅も位置合わせに使う）を焼き込んだ
-   `blank.pdf` が生成される。本文はマーカー・QR と被らないよう一回り縮小配置される。
-   **これを印刷して使う。**
-2. **領域指定** — エディタで設問ごとに解答欄をドラッグ指定し、配点・解答言語・
-   参照資料（模範解答／採点基準）を設定して保存。**採点形式**を設問タイプごとに選ぶ：
-   *答えのみ*（正答を入力しておき、数値の許容誤差・表記ゆれを吸収した決定的照合で自動採点。
-   曖昧なケースだけ Haiku にフォールバック）／*記述・論述*／*和訳*・*英訳*・*自由英作文*／
-   *証明・数式記述*／*計算・導出*・*論述・理由説明*／*グラフ・作図*・*構造式*。
-   形式ごとに専用の採点観点（`app/prompts/criteria/`）が共通プロンプトへ連結される。
-   和訳・英訳・自由英作文は解答言語が自動で固定される。
-3. **答案をスキャン** — 記入済み用紙を 300dpi 以上でスキャンして投入。
-   QR でテンプレートとページを自動判別し、ページ順が乱れていても並べ替える。
-4. **転記確認** — OCR 結果を目視で修正する。**転記と採点は別ステップ**にしてあるので、
-   転記ミスと実力不足が混ざらない。未記入の設問はチェックすると 0 点でスキップされる。
-5. **採点実行** — LLM 採点の形式は設問ごとに 1 リクエストで投げる。答えのみは決定的照合で
-   その場で採点する。グラフ・作図・構造式は答案画像を一次資料に採点する。
-   `graded.pdf` と復習ログが出力される。
+新しい答案には取り込み時の用紙定義のスナップショットも保存します。既存答案のある用紙は削除できません。復習ログは `logs/review/<session_id>.md` と `.jsonl` に出力し、再採点時は同じ答案のログを更新します。集計は現在有効な採点結果を使用します。
 
-## 位置合わせの確認
-
-印刷 → 記入 → スキャンした実物で、正規化のズレを測れる。
+## 検証と配布
 
 ```powershell
-# 実物のスキャンで確認
-python scripts/check_alignment.py <template_id> <scanned.pdf>
+# 外部APIなしの結合チェックと自己完結型ZIP作成
+./scripts/build_windows.ps1 -PortableOnly
 
-# 印刷せずパイプラインの健全性だけ確認（合成データ）
-python scripts/check_alignment.py <template_id> --synthetic
+# Inno Setup 6 がある場合はインストーラーも作成
+./scripts/build_windows.ps1 -Version 2.0.0
 ```
 
-300dpi で最大ズレ数 px 以内が目安（`alignment_error_px` は ArUco 中心と QR 隅の残差の max。
-QR 隅は検出ノイズが数 px 乗る）。大きく超える場合はスキャン解像度・四隅の切れ・影や折れを確認する。
+結合チェックは専用の一時フォルダーにPDFを生成し、登録、マーカー実測、180度回転・ページ入れ替え・台形補正、領域切り出し、JSON互換性、数値照合、採点、赤入れPDFの再レンダリング、転記変更後の再採点、履歴更新、キャンセルを検証します。既存データや実APIは使いません。
 
-## テスト
+GitHub ActionsはWindows上でチェック・発行を実行します。`v*` タグで `KakomonTrainer-Setup.exe` と `KakomonTrainer-win-x64.zip` をリリースします。設定に `owner/repository` を指定すると、アプリから更新を確認できます。
+
+リリースには `SHA256SUMS.txt` も添付します。ダウンロードが途中で切れたファイルは「このアプリはお使いのPCで実行できません」と表示されて起動しないため、実行前にハッシュの一致を確認してください。
 
 ```powershell
-pytest                    # 外部 API を叩くテストは既定で skip
-pytest -m integration     # 実 API を使うテスト（キー設定が必要）
+Get-FileHash .\KakomonTrainer-Setup.exe -Algorithm SHA256
 ```
-
-画面ロジックの回帰テストは Node.js 24系（24.15 以上）で実行できます。DOM 上で保存・採点の
-二重操作、通信失敗からの復帰、未保存の編集、領域エディタの選択を確認します。
-
-```powershell
-npm ci --prefix tests/frontend
-npm test --prefix tests/frontend
-```
-
-転記を変更して保存すると、採点済みセッションは転記確認待ちに戻ります。修正後の
-結果・赤入れ PDF は再採点後に表示されます。採点失敗時は転記を保持し、画面から
-再試行できます。使用中のテンプレートは、セッションの参照に必要なため削除できません。
 
 ## 構成
 
-| パス | 役割 |
-|---|---|
-| `app/geometry.py` | 4 系統の座標（正規化 / キャンバス実px / 切り出し内px / PDFpt）の型と変換、ホモグラフィ |
-| `app/markers.py` | ArUco 3 個・右下 QR の生成と検出（QR は 4 隅の座標も返す） |
-| `app/template_builder.py` | `blank.pdf` 生成（本文縮小配置）とマーカー中心・QR 隅の実測 |
-| `app/scanner.py` | 正規化 → QR 判定 → 領域切り出し → OCR |
-| `app/ocr/` | OCR バックエンド抽象化（google_vision / azure_di / claude_vision） |
-| `app/llm/` | 採点バックエンド抽象化（anthropic / openai 互換）と共通ツール定義。`answer_check.py` は答えのみ設問の Haiku フォールバック |
-| `app/answer_match.py` | 答えのみ設問の決定的照合（数値の許容誤差・分数・指数・単位除去・文字列正規化） |
-| `app/textnorm.py` | 突き合わせ用の文字列正規化（annotator と answer_match で共有） |
-| `app/prompts/criteria/` | 採点形式ごとの観点（和訳・英訳・自由英作文・証明・計算・グラフ作図・構造式）。共通プロンプトに連結 |
-| `app/grader.py` | 設問ごとの採点、リトライ、スコア整合性の補正、採点形式（answer_only / llm_text / llm_visual）の分岐 |
-| `app/annotator.py` | 引用 → 単語 bbox の突き合わせと赤入れ描画 |
-| `app/logger.py` | JSONL / Markdown ログと集計 |
-| `data/` | テンプレート・スキャン・結果・ログ（`.gitignore` 済み） |
+| パス | 内容 |
+| --- | --- |
+| `KakomonTrainer.sln` | Visual Studio用ソリューション |
+| `desktop/KakomonTrainer/MainWindow.xaml` | WPFの用紙・編集・確認・結果・設定画面 |
+| `desktop/KakomonTrainer/PdfService.cs` | PDFiumのCPUレンダリング、印刷用PDF・赤入れPDF |
+| `desktop/KakomonTrainer/ScanService.cs` | OpenCVによるQR・マーカー検出と位置補正 |
+| `desktop/KakomonTrainer/AiService.cs` | OCRと採点API |
+| `desktop/KakomonTrainer/GradingService.cs` | 数値照合、採点状態管理、復習ログ |
+| `desktop/KakomonTrainer/DataStore.cs` | 既存JSON互換、入力検証、保存 |
+| `desktop/KakomonTrainer.Checks` | ネイティブ処理の結合チェック |
 
-### 設計上の要点
+旧Python実装とそのテストは比較・移行用に残しています。新アプリと配布物からは使用しません。旧版の説明は [docs/legacy-python.md](docs/legacy-python.md) に保存しています。共通の採点プロンプトは `app/prompts/` から発行時にコピーします。
 
-- **座標系は 4 つある。** 仕様上は 3 つだが、赤入れ時に PDF ポイント空間への変換が入る。
-  各系は `NewType` で分離し、生成は必ず検証付きファクトリ（`make_norm_rect` など）を通す。
-- **ArUco の検出順は ID 順ではない。** `detectMarkers()` は検出順に返す（実測で `[3,1,0]`）。
-  `detect_aruco_markers()` が `dict[int, CanvasPx]` を返すのは、index で対応付けて
-  「エラーは出ないが誤ったホモグラフィ」になる事故を構造的に防ぐため。
-- **位置合わせは 2 段。** ArUco は 3 個しかなく透視ホモグラフィ（4 点必要）に足りない。
-  まず 3 ArUco のアフィン変換で粗く正規化 → その画像で右下 QR を読み、QR の 4 隅を
-  逆アフィンで生画像座標へ戻す → 3 ArUco 中心 + 4 QR 隅 = 7 点で `findHomography`
-  （全点最小二乗。QR 隅を RANSAC で捨てると 3 点に痩せて不安定になる）→ 生画像を一発で最終正規化。
-  QR が読めなければアフィン結果を暫定採用し `qr_detected=False` を立てる。
-- **切り出し原点は記録する。** ページ端ではマージンがクランプされるため、
-  `rect - margin` から逆算すると位置がずれる。実測原点を `session.json` に残して使う。
-- **Anthropic には `temperature` を送らない。** 現行の Claude モデルではこのパラメータが
-  削除されており、送ると 400 になる。OpenAI 互換側では従来どおり `temperature=0` を送る。
-- **OpenAI 互換に PDF は直接渡せない。** chat completions のコンテンツパートに PDF が無いため、
-  参照資料の PDF はページ画像に変換して送る。Anthropic だけネイティブの document ブロックを使う。
-- **同じ設問は「参照資料まで」をキャッシュする。** 採点は設問ごとに 1 リクエストで、同じ設問を
-  生徒の人数だけ繰り返す。`tools` → `system` → 参照資料 までは答案が変わっても不変なので、
-  最後の参照資料に `cache_control`（TTL 1 時間）を置いてキャッシュ読み出しに載せる
-  （`GRADING_PROMPT_CACHE=false` で無効化）。キャッシュには最小プレフィックス長があるため、
-  参照資料を .md 化してトークンを減らすと閾値を下回って効かなくなることがある。
-- **拡張思考は切らない。** Opus 5 は思考が既定で有効で、`thinking: disabled` にするとツール
-  呼び出しを `tool_use` ブロックではなく本文に書いてしまうことがある（エラーは出ず採点だけ
-  落ちる）。強制ツール呼び出しを拒むモデルに当たった場合は、思考ではなく `tool_choice` の
-  強制のほうを取り下げ、代わりに system でツール呼び出しを指示する。
-- **答えのみ設問は原則 LLM を呼ばない。** `answer_match.judge()` が数値（許容誤差つき）と
-  文字列（正規化一致）で ○×を確定させる。数値は必ず決着する。文字列は「近いが不一致」だけ
-  `uncertain` にし、フォールバックが有効なら Haiku、無効なら confidence=low ＋ 警告で人手確認へ回す。
-  採点モデルは設問ごとに `ResultQuestion.grader` / `.model` に記録する（記述式=Opus と
-  混在しても `Result.model` が嘘にならないように）。
-- **採点観点は設問タイプごとに切り替える。** `Question.answer_format`（`app/models.py` の
-  `ANSWER_FORMAT_META` が唯一の情報源）で採点経路を決め、`app/prompts/criteria/<値>.md` を
-  共通プロンプトへ連結する。旧 `written` は `essay` に読み替え（`SCHEMA_VERSION` 据え置き）。
-- **グラフ・作図・構造式は答案画像で採点する。** OCR 転記は当てにせず、`quote=""` の指摘を
-  `annotator` の領域枠フォールバックに載せる。答案画像が無い場合は LLM を呼ばず警告で止める。
-# Windows 配布版
-
-`v0.1.0` のようなタグを GitHub に push すると、GitHub Actions が単一ファイルの
-`KakomonTrainer-Setup.exe` を GitHub Releases に公開します。利用者はこのインストーラーを
-実行するだけでよく、Python は不要です。
-
-初回インストール時に `%APPDATA%\KakomonTrainer\.env` が作成されます。API キーと公開先を
-ここで指定します。テンプレート、スキャン、結果も `%APPDATA%\KakomonTrainer\data` に保存されるため、
-更新・アンインストールで失われません。
-
-配布版は窓を持たないため、起動すると既定のブラウザで UI を開きます。OCR の認証情報が未設定・
-不正なときは無言で終了せず、`.env` の場所を示すダイアログを出してから終了します。起動済みの
-状態でもう一度起動した場合は、二重起動せず既存の UI をブラウザで開き直します。
-窓が無く標準出力も持たないため、サーバーのログは `%APPDATA%\KakomonTrainer\logs\app.log` に追記されます。
-
-```dotenv
-UPDATE_REPOSITORY=GitHubユーザー名/リポジトリ名
-```
-
-この設定後、`GET /api/update` は GitHub Releases を確認し、`POST /api/update/install` は
-最新版のインストーラーをダウンロードして終了後にサイレント更新します。
-
-ローカルでのリリースビルドには Inno Setup 6 が必要です。
-
-```powershell
-pip install -r requirements-build.txt
-.\scripts\build_windows.ps1 -Version 0.1.0
-```
+同梱のBIZ UDゴシックは [Google Fonts / Morisawa BIZ UD Gothic](https://github.com/googlefonts/morisawa-biz-ud-gothic) のフォントです。SIL Open Font License 1.1の全文を `desktop/KakomonTrainer/Assets/Fonts/OFL.txt` に同梱しています。
