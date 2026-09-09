@@ -32,6 +32,8 @@ dotnet publish desktop/KakomonTrainer -c Release -r win-x64 --self-contained tru
 
 転記を変更して保存すると、以前の採点結果は再採点まで非表示になります。未保存の用紙・転記・点数の変更は画面移動・終了時に確認します。長時間処理中は操作をロックし、「処理を中止」でキャンセルできます。
 
+写真・スキャンの取り込み時には、マーカーとQRによる台形・回転補正の後、照明むらとコントラストを自動補正します。色を保持し、薄い筆跡を二値化せずに補正した画像を保存して、OCR・画像採点・答えのみの画像判定に使用します。元の入力ファイルは変更しません。既存答案に適用するには再取り込みしてください。
+
 ### 問題構成・配点の自動設定
 
 「用紙・領域の編集」で大学・年度・文理・科目を確認し、必要に応じて「問題用紙PDFを添付」から資料を追加して「配点・構成を自動設定」を押します。登録時には `kyodai_2021_rikei_kagaku_sheet.pdf` などのファイル名から大学・年度・科目を補完します。
@@ -63,7 +65,7 @@ dotnet publish desktop/KakomonTrainer -c Release -r win-x64 --self-contained tru
 ./scripts/build_windows.ps1 -PortableOnly
 
 # Inno Setup 6 がある場合はインストーラーも作成
-./scripts/build_windows.ps1 -Version 2.1.0
+./scripts/build_windows.ps1 -Version 2.1.1
 ```
 
 結合チェックは専用の一時フォルダーにPDFを生成し、登録、マーカー実測、180度回転・ページ入れ替え・台形補正、領域切り出し、JSON互換性、数値照合、採点、赤入れPDFの再レンダリング、転記変更後の再採点、履歴更新、キャンセルを検証します。既存データや実APIは使いません。

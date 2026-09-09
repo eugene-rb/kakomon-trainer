@@ -32,6 +32,7 @@ internal static class Program
     {
         var root = Path.Combine(Path.GetTempPath(), "KakomonWpfChecks-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(root);
         Console.WriteLine("Test workspace: " + root);
+        CheckDocumentImage(root);
         Check(AnswerMatcher.Judge("1/2", "0.5", 0) == true, "fraction comparison");
         Check(AnswerMatcher.Judge("25%", "0.25", 0) == true, "percentage comparison");
         Check(AnswerMatcher.Judge("1.2×10³", "1200", 0) == true, "superscript exponent");
@@ -109,10 +110,26 @@ internal static class Program
         plain.Text = "sk-edited-key"; reveal.IsChecked = false;
         Check(masked.Password == "sk-edited-key" && masked.Visibility == Visibility.Visible && plain.Visibility == Visibility.Collapsed, "edits made while revealed become the saved key");
         window.Close();
-        var scan = new ScanService(store, pdf, ai);
-        var s = await scan.ScanAsync(template, inputs.ToArray(), false, new Progress<string>(Console.WriteLine), default);
+        var ocrImages = new List<byte[]>();
+        var ocrSettings = new AppSettings();
+        ocrSettings.Values["OCR_BACKEND"] = "claude_vision";
+        ocrSettings.Values["ANTHROPIC_API_KEY"] = "fake-test-key";
+        ocrSettings.Values["ANTHROPIC_MODEL"] = "fake-test-model";
+        using var ocrAi = new AiService(ocrSettings, store, pdf, new StubHandler(async request =>
+        {
+            var body = JsonNode.Parse(await request.Content!.ReadAsStringAsync())!;
+            ocrImages.Add(Convert.FromBase64String(body["messages"]![0]!["content"]![1]!["source"]!["data"]!.ToString()));
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{\"content\":[{\"type\":\"text\",\"text\":\"答案\"}]}") };
+        }));
+        var scan = new ScanService(store, pdf, ocrAi);
+        var s = await scan.ScanAsync(template, inputs.ToArray(), true, new Progress<string>(Console.WriteLine), default);
         Check(s.Status == "ready" && s.Pages.Select(p => p.PageNo).SequenceEqual([2, 1]), "rotated shuffled scan identified by QR");
         Check(s.Crops.Count == 2 && s.Crops.All(c => c.CropOriginCanvas.Length == 2 && c.CropW > 0), "crop geometry persisted");
+        Check(ocrImages.Count == s.Crops.Count && s.Crops.Select((crop, i) => File.ReadAllBytes(Path.Combine(store.SessionDir(s.SessionId), "crops", crop.Filename)).SequenceEqual(ocrImages[i])).All(equal => equal), "OCR receives the saved enhanced crops");
+        using (var normalized = Cv2.ImRead(store.NormalizedPath(s, s.Pages[0])))
+        using (var aligned = Cv2.ImDecode(ScanService.Align(File.ReadAllBytes(inputs[0]), template).Bytes, ImreadModes.Color))
+        using (var expected = Cv2.ImDecode(DocumentImage.Enhance(aligned), ImreadModes.Color))
+            Check(Cv2.Norm(normalized, expected, NormTypes.L1) == 0, "saved page applies contrast after perspective correction");
         using (var image = Cv2.ImDecode(images[0], ImreadModes.Color))
         using (var distorted = new Mat())
         {
@@ -145,6 +162,35 @@ internal static class Program
         await CheckStructureContract(store, pdf, root);
         Console.WriteLine($"All {count} checks passed. Artifacts: {root}");
     }
+    private static void CheckDocumentImage(string root)
+    {
+        using var photo = new Mat(400, 800, MatType.CV_8UC3);
+        for (var x = 0; x < 800; x++)
+        {
+            var paper = 110 + 120 * x / (photo.Width - 1);
+            Cv2.Line(photo, new OpenCvSharp.Point(x, 0), new OpenCvSharp.Point(x, photo.Height - 1), new Scalar(paper, paper, paper));
+        }
+        Cv2.PutText(photo, "Pencil: x + 1 = 2", new OpenCvSharp.Point(30, 190), HersheyFonts.HersheySimplex, 0.8, new Scalar(90, 90, 90), 1, LineTypes.AntiAlias);
+        Cv2.Line(photo, new OpenCvSharp.Point(80, 240), new OpenCvSharp.Point(160, 240), new Scalar(98, 98, 98), 1);
+        Cv2.Line(photo, new OpenCvSharp.Point(500, 240), new OpenCvSharp.Point(580, 240), new Scalar(50, 50, 180), 3);
+        using var before = photo.Clone();
+        using var enhanced = Cv2.ImDecode(DocumentImage.Enhance(photo), ImreadModes.Color);
+        Check(enhanced.Size() == photo.Size() && enhanced.Channels() == 3 && Cv2.Norm(photo, before, NormTypes.L1) == 0, "image enhancement preserves dimensions, colour and input");
+        var left = enhanced.At<Vec3b>(50, 80).Item0;
+        var right = enhanced.At<Vec3b>(50, 720).Item0;
+        Check(left > 220 && Math.Abs(right - left) < 15, "uneven paper illumination is flattened");
+        var ink = enhanced.At<Vec3b>(240, 120).Item0;
+        var paperAfter = enhanced.At<Vec3b>(230, 120).Item0;
+        var originalContrast = photo.At<Vec3b>(230, 120).Item0 - photo.At<Vec3b>(240, 120).Item0;
+        Check(paperAfter - ink > originalContrast && ink > 0 && ink < 240, "faint pencil contrast improves without binarization");
+        var red = enhanced.At<Vec3b>(240, 540);
+        Check(red.Item2 > red.Item0 + 50 && red.Item2 > red.Item1 + 50, "coloured ink remains distinguishable");
+        photo.SaveImage(Path.Combine(root, "photo-before.png"));
+        enhanced.SaveImage(Path.Combine(root, "photo-enhanced.png"));
+        using var white = new Mat(80, 80, MatType.CV_8UC3, Scalar.White);
+        using var whiteEnhanced = Cv2.ImDecode(DocumentImage.Enhance(white), ImreadModes.Color);
+        Check(Cv2.Mean(whiteEnhanced).Val0 > 240, "blank paper stays blank");
+    }
     private static async Task CheckApiContracts(DataStore store, PdfService pdf, Template template, Session session)
     {
         const string grade = """
@@ -160,6 +206,10 @@ internal static class Program
             {
                 var body = JsonNode.Parse(await request.Content!.ReadAsStringAsync())!;
                 Check(body["model"]!.ToString() == "fake-test-model" && body["tools"]!.AsArray().Count == 1, provider + " structured tool request");
+                var sent = body["messages"]!.AsArray().Last()!["content"]!.AsArray().Last()!;
+                var encoded = provider == "anthropic" ? sent["source"]!["data"]!.ToString() : sent["image_url"]!["url"]!.ToString().Split(',')[1];
+                var crop = session.Crops.First(c => c.QuestionId == question.Id);
+                Check(Convert.FromBase64String(encoded).SequenceEqual(File.ReadAllBytes(Path.Combine(store.SessionDir(session.SessionId), "crops", crop.Filename))), provider + " grading receives the enhanced crop");
                 if (provider == "anthropic")
                 {
                     Check(request.Headers.Contains("x-api-key") && body["temperature"] == null, "Anthropic headers and no temperature");

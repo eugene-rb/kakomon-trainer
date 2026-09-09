@@ -22,9 +22,15 @@ public sealed class ScanService(DataStore store, PdfService pdf, AiService ai)
                 {
                     token.ThrowIfCancellationRequested(); progress.Report($"{index + 1}枚目を位置合わせ中…");
                     var aligned = await Task.Run(() => Align(bytes, template), token);
+                    progress.Report($"{index + 1}枚目の照明むら・コントラストを補正中…");
+                    var enhanced = await Task.Run(() =>
+                    {
+                        using var image = Cv2.ImDecode(aligned.Bytes, ImreadModes.Color);
+                        return DocumentImage.Enhance(image);
+                    }, token);
                     if (session.Pages.Any(p => p.PageNo == aligned.Page.PageNo)) throw new InvalidDataException($"{aligned.Page.PageNo}ページが重複しています。答案1組ずつ取り込んでください。");
                     var filename = $"page_{aligned.Page.PageNo}.png";
-                    await File.WriteAllBytesAsync(DataStore.Child(Path.Combine(dir, "normalized"), filename), aligned.Bytes, token);
+                    await File.WriteAllBytesAsync(DataStore.Child(Path.Combine(dir, "normalized"), filename), enhanced, token);
                     session.Pages.Add(new PageRecord { PageNo = aligned.Page.PageNo, SourceIndex = index++, TemplateId = template.TemplateId, NormalizedFilename = filename, QrDetected = true, QrPayload = aligned.Payload, MarkerIds = [0, 1, 3], AlignmentErrorPx = aligned.Error });
                     if (aligned.Error > 10) session.Warnings.Add($"{aligned.Page.PageNo}ページ: 位置合わせ残差 {aligned.Error:F1}px。切り出し画像を確認してください。");
                 }
